@@ -11,6 +11,13 @@
 ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)
 [![English README](https://img.shields.io/badge/README-English-blue)](README.en.md)
 
+<p align="center">
+  <b>🌟 推荐项目 / Related Project</b><br><br>
+  <a href="https://github.com/EchoSixHIYA/WebSpeak-client-for-TeamSpeak">
+    <img src="https://gh-card.dev/repos/EchoSixHIYA/WebSpeak-client-for-TeamSpeak.svg?fullname=true" alt="WebSpeak-client-for-TeamSpeak" />
+  </a>
+</p>
+
 > 🎵 **TSBot (NeteaseTSBot)** 是一个专为 **TeamSpeak (TS / TS3 / TS6)** 打造的高性能多平台音乐点播机器人 (Music Bot)。  
 > 支持 **网易云音乐 (Netease Cloud Music)**、**QQ 音乐** 与 **Bilibili (B站)** 音频解析与点播播放，并配备开箱即用的 Web 控制台与一键式部署方案。
 
