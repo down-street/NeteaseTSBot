@@ -208,16 +208,23 @@ jobs:
       - name: Install voice-service build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake musl-tools
+          sudo apt-get install -y --no-install-recommends cmake
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
 
-      - name: Build voice-service
-        # Static musl build: runs on any x86-64 Linux, no glibc/OpenSSL version requirements.
-        run: cargo build --manifest-path voice-service/Cargo.toml --release --target x86_64-unknown-linux-musl
+      - name: Build voice-service (Debian 11, glibc 2.31)
+        # 在旧 glibc 容器里编译，产物可在 Debian 11+/Ubuntu 20.04+/Alibaba Cloud Linux 3 等系统上运行。
+        # 配合 rustls（无 OpenSSL 依赖），不再需要宿主机安装 libssl。
+        run: |
+          docker run --rm -v "$PWD":/w -w /w debian:bullseye-slim bash -lc '
+            set -euo pipefail
+            apt-get update
+            apt-get install -y --no-install-recommends curl ca-certificates build-essential cmake pkg-config git
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            . "$HOME/.cargo/env"
+            cargo build --manifest-path voice-service/Cargo.toml --release
+          '
 
       - name: Create release bundle
         run: |
@@ -230,7 +237,7 @@ jobs:
             backend/ "$bundle_dir/backend/"
           rsync -a proto/ "$bundle_dir/proto/"
           rsync -a web/dist/ "$bundle_dir/web/dist/"
-          install -m 755 voice-service/target/x86_64-unknown-linux-musl/release/voice-service "$bundle_dir/bin/voice-service"
+          install -m 755 voice-service/target/release/voice-service "$bundle_dir/bin/voice-service"
           cp tsbot.env.example README.md README.en.md HOWTOSTART.md LICENSE docker-compose.yml docker-compose.prebuilt.yml "$bundle_dir/"
           cp run-backend.sh run-web.sh run-voicemake.sh nohup-start.sh nohup-stop.sh nohup-status.sh "$bundle_dir/"
           mkdir -p dist
