@@ -20,7 +20,10 @@ _synth_lock = asyncio.Lock()
 
 def tts_audio_path(token: str) -> Path:
     """Resolve a token to a file inside the TTS directory (path-traversal safe)."""
-    safe = "".join(ch for ch in str(token or "") if ch in "0123456789abcdefABCDEF")[:64]
+    # 去掉扩展名再过滤，否则 "xxx.mp3" 里的 "3" 会被当成 token 的一部分，
+    # 导致按 URL 请求时解析出不同的文件名（404）。
+    stem = Path(str(token or "")).stem
+    safe = "".join(ch for ch in stem if ch in "0123456789abcdefABCDEF")[:64]
     return TTS_DIR / f"{safe}.mp3"
 
 

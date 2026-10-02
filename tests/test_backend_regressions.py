@@ -379,6 +379,21 @@ class ChatSourceParsingTests(unittest.TestCase):
         self.assertLessEqual(len(text), main._TS_NICKNAME_MAX_CHARS)
         self.assertEqual("♪ 歌名 - 歌手", main._format_ts_scrolling_nickname("歌名", "", "歌手"))
 
+    def test_long_title_still_shows_lyric(self) -> None:
+        """B站长标题不能把 30 字符预算吃光，否则昵称永远不会滚动。"""
+        title = "【4K60帧】超清修复周杰伦/张惠妹《不该》MV！缘若尽了就不该重来"
+        first = main._format_ts_scrolling_nickname(title, "假装我们还在一块")
+        second = main._format_ts_scrolling_nickname(title, "缘若尽了就不该重来")
+        self.assertNotEqual(first, second)
+        self.assertIn("假装我们还在一块"[:4], first)
+        for text in (first, second):
+            self.assertLessEqual(len(text), main._TS_NICKNAME_MAX_CHARS)
+            self.assertLessEqual(len(text.encode("utf-8")), main._TS_NICKNAME_MAX_BYTES)
+
+    def test_nickname_respects_byte_limit(self) -> None:
+        text = main._format_ts_scrolling_nickname("一" * 40, "二" * 40)
+        self.assertLessEqual(len(text.encode("utf-8")), main._TS_NICKNAME_MAX_BYTES)
+
     def test_lyric_line_selection_uses_latest_timestamp(self) -> None:
         lines = [
             main.LyricLine(time=0.0, text="a"),
@@ -602,6 +617,15 @@ class BilibiliBrowserSubtitleTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatTtsTests(unittest.IsolatedAsyncioTestCase):
+    def test_tts_route_token_drops_extension(self) -> None:
+        from backend.tts import tts_audio_path
+
+        with_extension = tts_audio_path("3588b933d723067aad39680ed3703837.mp3")
+        without_extension = tts_audio_path("3588b933d723067aad39680ed3703837")
+        self.assertEqual(without_extension, with_extension)
+        self.assertEqual("3588b933d723067aad39680ed3703837.mp3", with_extension.name)
+        self.assertTrue(with_extension.parent.name == "tts")
+
     def test_command_detection_without_prefix(self) -> None:
         self.assertTrue(main._is_ts_chat_command("play 稻香"))
         self.assertTrue(main._is_ts_chat_command("播放 qq 稻香"))

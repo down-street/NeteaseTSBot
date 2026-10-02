@@ -653,6 +653,10 @@ def _resolve_playback_position_s(*, now_s: float, started_at: float, paused_at: 
 
 _TS_NICKNAME_MAX_CHARS = 30
 _TS_NICKNAME_PREFIX = "♪ "
+_TS_NICKNAME_SEP = " - "
+# TeamSpeak 对昵称还有隐含的字节上限：实测 85 字节可用、88 字节被服务器拒绝
+# （报 ParameterInvalidSize），这里保守取 84 字节。
+_TS_NICKNAME_MAX_BYTES = 84
 _TS_AVATAR_MAX_EDGE = 128
 _TS_AVATAR_MAX_BYTES = 100 * 1024
 _TS_AVATAR_CACHE_MAX_ITEMS = 32
@@ -668,16 +672,40 @@ def _ts_base_nickname() -> str:
     return base or "tsbot"
 
 
+def _ts_nickname_trim(text: str) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) > _TS_NICKNAME_MAX_CHARS:
+        compact = compact[:_TS_NICKNAME_MAX_CHARS]
+    while len(compact.encode("utf-8")) > _TS_NICKNAME_MAX_BYTES and len(compact) > 1:
+        compact = compact[:-1]
+    return compact
+
+
 def _format_ts_scrolling_nickname(title: str, lyric_line: str, artist: str = "") -> str:
+    prefix = _TS_NICKNAME_PREFIX
+    sep = _TS_NICKNAME_SEP
     t = (title or "").strip() or "未知曲目"
     line = (lyric_line or "").strip()
-    if line:
-        text = f"{_TS_NICKNAME_PREFIX}{t} - {line}"
-    else:
+    if not line:
         a = (artist or "").strip()
-        text = f"{_TS_NICKNAME_PREFIX}{t} - {a}" if a else f"{_TS_NICKNAME_PREFIX}{t}"
-    compact = " ".join(text.split())
-    return compact[:_TS_NICKNAME_MAX_CHARS]
+        return _ts_nickname_trim(f"{prefix}{t}{sep}{a}" if a else f"{prefix}{t}")
+
+    # 预算有限时优先保证歌词可见：标题过长就截标题，而不是把歌词整段截掉
+    room = max(4, _TS_NICKNAME_MAX_CHARS - len(prefix) - len(sep))
+    line_keep = min(len(line), max(4, room // 2))
+    title_keep = max(1, room - line_keep)
+    t2, l2 = t[:title_keep], line[:line_keep]
+    while (
+        len(f"{prefix}{t2}{sep}{l2}".encode("utf-8")) > _TS_NICKNAME_MAX_BYTES
+        and (len(t2) > 1 or len(l2) > 1)
+    ):
+        if len(t2) >= len(l2) and len(t2) > 1:
+            t2 = t2[:-1]
+        elif len(l2) > 1:
+            l2 = l2[:-1]
+        else:
+            break
+    return _ts_nickname_trim(f"{prefix}{t2}{sep}{l2}")
 
 
 def _lyric_line_at(lyrics: list[LyricLine], position_s: float) -> str:
