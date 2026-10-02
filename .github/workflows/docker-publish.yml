@@ -208,13 +208,16 @@ jobs:
       - name: Install voice-service build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake
+          sudo apt-get install -y --no-install-recommends cmake musl-tools
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - name: Build voice-service
-        run: cargo build --manifest-path voice-service/Cargo.toml --release
+        # Static musl build: runs on any x86-64 Linux, no glibc/OpenSSL version requirements.
+        run: cargo build --manifest-path voice-service/Cargo.toml --release --target x86_64-unknown-linux-musl
 
       - name: Create release bundle
         run: |
@@ -227,7 +230,7 @@ jobs:
             backend/ "$bundle_dir/backend/"
           rsync -a proto/ "$bundle_dir/proto/"
           rsync -a web/dist/ "$bundle_dir/web/dist/"
-          install -m 755 voice-service/target/release/voice-service "$bundle_dir/bin/voice-service"
+          install -m 755 voice-service/target/x86_64-unknown-linux-musl/release/voice-service "$bundle_dir/bin/voice-service"
           cp tsbot.env.example README.md README.en.md HOWTOSTART.md LICENSE docker-compose.yml docker-compose.prebuilt.yml "$bundle_dir/"
           cp run-backend.sh run-web.sh run-voicemake.sh nohup-start.sh nohup-stop.sh nohup-status.sh "$bundle_dir/"
           mkdir -p dist
