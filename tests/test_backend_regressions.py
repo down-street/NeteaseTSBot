@@ -728,6 +728,45 @@ class ChatTtsTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NicknameDriftTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_keeps_retrying_after_send_failure(self) -> None:
+        """voice-service 暂不可用时（如容器重启）worker 不能退出，恢复后要能继续更新昵称。"""
+        item = SimpleNamespace(id=9, title="测试视频", artist="UP主")
+        session = unittest.mock.Mock()
+        session.get.return_value = item
+        sent: list[str] = []
+        calls = {"n": 0}
+
+        async def flaky(name: str) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("voice-service unavailable")
+            sent.append(name)
+
+        main._ts_presence_generation = 0
+        main._ts_last_nickname = ""
+
+        with (
+            patch.object(main, "new_session", return_value=session),
+            patch.object(main, "_fetch_lyrics_for_item", AsyncMock(return_value=[])),
+            patch.object(main, "_ts_lyric_interval_s", return_value=0.05),
+            patch.object(main, "_current_queue_item_id", 9),
+            patch.object(main, "_play_started_at", time.monotonic()),
+            patch.object(main, "_paused_at", None),
+            patch.object(main, "_paused_total_s", 0.0),
+            patch.object(main.voice, "set_client_nickname", AsyncMock(side_effect=flaky)),
+        ):
+            generation = main._bump_ts_presence_generation()
+            task = asyncio.create_task(main._ts_lyric_worker(9, generation))
+            await asyncio.sleep(0.4)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        self.assertGreaterEqual(len(sent), 1)
+        self.assertEqual("♪ 测试视频 - UP主", sent[0])
+
     async def test_worker_reasserts_nickname_after_external_reset(self) -> None:
         """切歌后遗留的“还原默认昵称”覆盖了昵称时，worker 应在一个周期内改回来。"""
         item = SimpleNamespace(id=7, title="测试视频", artist="UP主")

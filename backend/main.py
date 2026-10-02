@@ -657,6 +657,8 @@ _TS_NICKNAME_SEP = " - "
 # TeamSpeak 对昵称还有隐含的字节上限：实测 85 字节可用、88 字节被服务器拒绝
 # （报 ParameterInvalidSize），这里保守取 84 字节。
 _TS_NICKNAME_MAX_BYTES = 84
+# 即使显示内容没变，也定期重发一次昵称：覆盖“服务器重置昵称（重连/重启）”的情况
+_TS_NICKNAME_REASSERT_S = 15.0
 _TS_AVATAR_MAX_EDGE = 128
 _TS_AVATAR_MAX_BYTES = 100 * 1024
 _TS_AVATAR_CACHE_MAX_ITEMS = 32
@@ -782,6 +784,8 @@ async def _ts_lyric_worker(item_id: int, generation: int) -> None:
 
         lyrics = await _fetch_lyrics_for_item(int(item_id))
         interval = _ts_lyric_interval_s()
+        last_sent_at = 0.0
+        last_warn_at = 0.0
 
         while True:
             if generation != _ts_presence_generation:
@@ -816,13 +820,22 @@ async def _ts_lyric_worker(item_id: int, generation: int) -> None:
             # 与「实际最后一次下发的昵称」比较，而不是本地变量：
             # 切歌时的“还原默认昵称”任务是异步的，可能在新视频开始后才落地；
             # 用全局值比较可以在下一个周期自动纠正回来。
-            if display and display != _ts_last_nickname:
+            now = time.monotonic()
+            need_send = bool(display) and (
+                display != _ts_last_nickname or (now - last_sent_at) >= _TS_NICKNAME_REASSERT_S
+            )
+            if need_send:
                 try:
                     await voice.set_client_nickname(display)
                     _ts_last_nickname = display
+                    last_sent_at = now
                 except Exception as exc:
-                    logger.warning("ts3 lyric nickname update failed, disabling: %s", exc)
-                    return
+                    # 不要退出：容器重启/voice-service 重连期间失败是暂时的，
+                    # 继续重试即可；同时清空记录以便下一轮强制重发。
+                    _ts_last_nickname = ""
+                    if now - last_warn_at >= 60.0:
+                        last_warn_at = now
+                        logger.warning("ts3 lyric nickname update failed (will retry): %s", exc)
 
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
@@ -4878,6 +4891,8 @@ async def _maybe_speak_chat_message(invoker_name: str, message: str) -> None:
             resp = await client.get(api_url)
         if resp.status_code >= 400:
             logger.warning("chat tts 播放失败: http=%s body=%s", resp.status_code, resp.text[:200])
+        else:
+            logger.info("chat tts 已播报: %s", speak_text[:40])
     except Exception as exc:
         logger.warning("chat tts 失败: %s", exc)
 
