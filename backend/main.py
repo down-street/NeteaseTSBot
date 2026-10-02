@@ -654,9 +654,10 @@ def _resolve_playback_position_s(*, now_s: float, started_at: float, paused_at: 
 _TS_NICKNAME_MAX_CHARS = 30
 _TS_NICKNAME_PREFIX = "♪ "
 _TS_NICKNAME_SEP = " - "
-# TeamSpeak 对昵称还有隐含的字节上限：实测 85 字节可用、88 字节被服务器拒绝
-# （报 ParameterInvalidSize），这里保守取 84 字节。
-_TS_NICKNAME_MAX_BYTES = 84
+# TeamSpeak 实际限制的是「转义后长度」≤ 30：空格在协议里是 \s（占 2 个字符），
+# 实测 "♪ 世界…【卡缇 - ♪ 背包塞满青涩的回忆"（29 字符/4 空格→33）会被服务器
+# 以 ParameterInvalidSize 拒绝，而同样 29 字符只有 1 个空格的昵称可以通过。
+_TS_NICKNAME_MAX_ESCAPED = 30
 # 即使显示内容没变，也定期重发一次昵称：覆盖“服务器重置昵称（重连/重启）”的情况
 _TS_NICKNAME_REASSERT_S = 15.0
 _TS_AVATAR_MAX_EDGE = 128
@@ -674,11 +675,17 @@ def _ts_base_nickname() -> str:
     return base or "tsbot"
 
 
+def _ts_escaped_len(text: str) -> int:
+    """TS3 协议里空格/反斜杠/斜杠/竖线/制表符等会被转义成 2 个字符。"""
+    extra = sum(1 for ch in text if ch == " " or ch in "\\|/\n\r\t")
+    return len(text) + extra
+
+
 def _ts_nickname_trim(text: str) -> str:
     compact = " ".join((text or "").split())
-    if len(compact) > _TS_NICKNAME_MAX_CHARS:
-        compact = compact[:_TS_NICKNAME_MAX_CHARS]
-    while len(compact.encode("utf-8")) > _TS_NICKNAME_MAX_BYTES and len(compact) > 1:
+    while compact and (
+        len(compact) > _TS_NICKNAME_MAX_CHARS or _ts_escaped_len(compact) > _TS_NICKNAME_MAX_ESCAPED
+    ):
         compact = compact[:-1]
     return compact
 
@@ -698,7 +705,7 @@ def _format_ts_scrolling_nickname(title: str, lyric_line: str, artist: str = "")
     title_keep = max(1, room - line_keep)
     t2, l2 = t[:title_keep], line[:line_keep]
     while (
-        len(f"{prefix}{t2}{sep}{l2}".encode("utf-8")) > _TS_NICKNAME_MAX_BYTES
+        _ts_escaped_len(f"{prefix}{t2}{sep}{l2}") > _TS_NICKNAME_MAX_ESCAPED
         and (len(t2) > 1 or len(l2) > 1)
     ):
         if len(t2) >= len(l2) and len(t2) > 1:

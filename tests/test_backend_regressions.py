@@ -388,11 +388,22 @@ class ChatSourceParsingTests(unittest.TestCase):
         self.assertIn("假装我们还在一块"[:4], first)
         for text in (first, second):
             self.assertLessEqual(len(text), main._TS_NICKNAME_MAX_CHARS)
-            self.assertLessEqual(len(text.encode("utf-8")), main._TS_NICKNAME_MAX_BYTES)
+            self.assertLessEqual(main._ts_escaped_len(text), main._TS_NICKNAME_MAX_ESCAPED)
 
-    def test_nickname_respects_byte_limit(self) -> None:
+    def test_nickname_respects_escaped_length_limit(self) -> None:
+        """实测被服务器拒绝的真实样例：转义后 33 > 30。"""
+        text = main._format_ts_scrolling_nickname(
+            "世界这么大还是遇见你【卡缇娅也不知道鸭二周年】",
+            "♪ 背包塞满青涩的回忆",
+            "卡缇娅也不知道鸭",
+        )
+        self.assertLessEqual(main._ts_escaped_len(text), main._TS_NICKNAME_MAX_ESCAPED)
+        self.assertIn("♪ 背包", text)
+
+    def test_nickname_respects_char_limit(self) -> None:
         text = main._format_ts_scrolling_nickname("一" * 40, "二" * 40)
-        self.assertLessEqual(len(text.encode("utf-8")), main._TS_NICKNAME_MAX_BYTES)
+        self.assertLessEqual(len(text), main._TS_NICKNAME_MAX_CHARS)
+        self.assertLessEqual(main._ts_escaped_len(text), main._TS_NICKNAME_MAX_ESCAPED)
 
     def test_lyric_line_selection_uses_latest_timestamp(self) -> None:
         lines = [
