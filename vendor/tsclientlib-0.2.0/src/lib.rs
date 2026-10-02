@@ -1125,12 +1125,18 @@ impl Connection {
 			ConnectionState::Connecting(fut, reconnect) => match fut.poll_unpin(cx) {
 				Poll::Pending => Poll::Pending,
 				Poll::Ready(Err(Error::IdentityLevel(level))) => {
+					// The connect future has completed. Park it so it is never polled again:
+					// polling a completed `async fn` future panics with
+					// "`async fn` resumed after completion".
+					*fut = Box::pin(future::pending::<Result<(client::Client, data::Connection)>>());
 					if let Err(e) = self.increase_identity_level(level) {
 						return Poll::Ready(Some(Err(e)));
 					}
 					Poll::Ready(Some(Ok(StreamItem::IdentityLevelIncreasing(level))))
 				}
 				Poll::Ready(Err(e)) => {
+					// See above: never poll the completed connect future a second time.
+					*fut = Box::pin(future::pending::<Result<(client::Client, data::Connection)>>());
 					if *reconnect {
 						if let Error::ConnectFailed { errors, .. } = &e {
 							for e in errors {
@@ -1183,6 +1189,11 @@ impl Connection {
 			ConnectionState::IdentityLevelIncreasing { recv, .. } => match recv.poll_unpin(cx) {
 				Poll::Pending => Poll::Pending,
 				Poll::Ready(Err(_)) => {
+					// The receiver is completed; replace the state so it is not polled again.
+					self.state = ConnectionState::Connecting(
+						Box::pin(future::pending::<Result<(client::Client, data::Connection)>>()),
+						false,
+					);
 					Poll::Ready(Some(Err(Error::IdentityLevelIncreaseFailedThread)))
 				}
 				Poll::Ready(Ok(identity)) => {
