@@ -112,6 +112,27 @@ class VoiceClient:
         assert self._pb2 is not None
         await stub.SetClientDescription(self._pb2.SetClientDescriptionRequest(description=description))
 
+    async def set_client_nickname(self, nickname: str) -> None:
+        stub = self._get_stub()
+        assert self._pb2 is not None
+        resp = await stub.SetClientNickname(
+            self._pb2.SetClientNicknameRequest(nickname=nickname)
+        )
+        if not bool(getattr(resp, "ok", False)):
+            raise RuntimeError(str(getattr(resp, "message", "") or "set nickname failed"))
+
+    async def set_client_avatar(self, image: bytes = b"", *, restore_default: bool = False) -> None:
+        stub = self._get_stub()
+        assert self._pb2 is not None
+        resp = await stub.SetClientAvatar(
+            self._pb2.SetClientAvatarRequest(
+                image=image or b"",
+                restore_default=bool(restore_default),
+            )
+        )
+        if not bool(getattr(resp, "ok", False)):
+            raise RuntimeError(str(getattr(resp, "message", "") or "set avatar failed"))
+
     async def set_volume(self, volume_percent: int) -> None:
         stub = self._get_stub()
         assert self._pb2 is not None

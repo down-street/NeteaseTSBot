@@ -170,6 +170,87 @@ struct AvatarUploadState {
     handle: tsclientlib::FiletransferHandle,
     local_path: PathBuf,
     md5_hex: String,
+    dynamic: bool,
+    cleanup_local: bool,
+}
+
+/// An avatar upload that is waiting for the current transfer to finish.
+struct PendingAvatarUpload {
+    local_path: PathBuf,
+    md5_hex: String,
+    size: u64,
+    dynamic: bool,
+    cleanup_local: bool,
+}
+
+/// Requests pushed from the gRPC service into the TeamSpeak actor.
+enum AvatarCommand {
+    Set { local_path: PathBuf, md5_hex: String },
+    Restore,
+}
+
+/// Max accepted avatar payload (before upload). TeamSpeak itself is far stricter.
+const MAX_AVATAR_BYTES: usize = 2 * 1024 * 1024;
+
+fn avatar_remote_path(md5_hex: &str) -> String {
+    format!("/avatar_{}", md5_hex)
+}
+
+/// Best-effort deletion of an avatar file from the TeamSpeak file repository.
+///
+/// tsclientlib only exposes upload/download, so a raw file transfer connection
+/// is used. Failures are expected on restricted servers and are only logged.
+async fn filetransfer_delete_avatar(host: &str, port: u16, md5_hex: &str) {
+    if port == 0 || host.trim().is_empty() {
+        return;
+    }
+
+    let addr = format!("{}:{}", host.trim(), port);
+    let stream = match tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            info!("avatar cleanup skipped: connect {addr} failed: {e}");
+            return;
+        }
+        Err(_) => {
+            info!("avatar cleanup skipped: connect {addr} timed out");
+            return;
+        }
+    };
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // The file transfer port may announce itself with a banner; ignore it when present.
+    let mut banner = String::new();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(300),
+        reader.read_line(&mut banner),
+    )
+    .await;
+
+    let cmd = format!("delete path={}", avatar_remote_path(md5_hex));
+    if write_half.write_all(cmd.as_bytes()).await.is_err()
+        || write_half.write_all(b"\n").await.is_err()
+        || write_half.flush().await.is_err()
+    {
+        info!("avatar cleanup failed: write error for {md5_hex}");
+        return;
+    }
+
+    let mut response = String::new();
+    match tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut response)).await {
+        Ok(Ok(_)) => {
+            let line = response.trim();
+            if line.starts_with("error id=0") || line.contains("msg=ok") {
+                info!("avatar cleanup deleted {}", avatar_remote_path(md5_hex));
+            } else {
+                info!("avatar cleanup rejected for {md5_hex}: {line}");
+            }
+        }
+        Ok(Err(e)) => info!("avatar cleanup read error for {md5_hex}: {e}"),
+        Err(_) => info!("avatar cleanup timed out for {md5_hex}"),
+    }
 }
 
 fn pick_avatar_file(dir: &Path) -> Option<PathBuf> {
@@ -243,6 +324,7 @@ struct VoiceServiceImpl {
     ts3_audio_tx: mpsc::Sender<OutPacket>,
     ts3_notice_tx: mpsc::Sender<(i32, String)>,
     ts3_cmd_tx: mpsc::Sender<OutCommand>,
+    ts3_avatar_tx: mpsc::Sender<AvatarCommand>,
     events_tx: broadcast::Sender<voicev1::Event>,
     persist_tx: mpsc::Sender<PersistedVoiceState>,
 }
@@ -418,6 +500,88 @@ impl VoiceService for VoiceServiceImpl {
         Ok(Response::new(voicev1::CommandResponse {
             ok: true,
             message: "ok".to_string(),
+        }))
+    }
+
+    async fn set_client_nickname(
+        &self,
+        req: Request<voicev1::SetClientNicknameRequest>,
+    ) -> std::result::Result<Response<voicev1::CommandResponse>, Status> {
+        let r = req.into_inner();
+        let cleaned = r.nickname.replace(['\r', '\n', '\t'], " ");
+        let compact = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        if compact.is_empty() {
+            return Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message: "nickname is empty".to_string(),
+            }));
+        }
+        if compact.chars().count() > 30 {
+            return Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message: "nickname too long".to_string(),
+            }));
+        }
+
+        let encoded = ts3_escape_value(&compact);
+        let mut cmd = OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "clientupdate");
+        cmd.write_arg("client_nickname", &encoded);
+
+        self.ts3_cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|e| Status::internal(format!("send failed: {e}")))?;
+
+        Ok(Response::new(voicev1::CommandResponse {
+            ok: true,
+            message: "ok".to_string(),
+        }))
+    }
+
+    async fn set_client_avatar(
+        &self,
+        req: Request<voicev1::SetClientAvatarRequest>,
+    ) -> std::result::Result<Response<voicev1::CommandResponse>, Status> {
+        let r = req.into_inner();
+        if r.restore_default || r.image.is_empty() {
+            let _ = self.ts3_avatar_tx.send(AvatarCommand::Restore).await;
+            return Ok(Response::new(voicev1::CommandResponse {
+                ok: true,
+                message: "accepted".to_string(),
+            }));
+        }
+
+        if r.image.len() > MAX_AVATAR_BYTES {
+            return Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message: "avatar image too large".to_string(),
+            }));
+        }
+
+        let md5_hex = format!("{:x}", md5::compute(&r.image));
+        let local_path = std::env::temp_dir().join(format!("tsbot-avatar-{md5_hex}.img"));
+        tokio::fs::write(&local_path, &r.image)
+            .await
+            .map_err(|e| Status::internal(format!("write avatar failed: {e}")))?;
+
+        if self
+            .ts3_avatar_tx
+            .send(AvatarCommand::Set {
+                local_path,
+                md5_hex,
+            })
+            .await
+            .is_err()
+        {
+            return Ok(Response::new(voicev1::CommandResponse {
+                ok: false,
+                message: "voice actor is not running".to_string(),
+            }));
+        }
+
+        Ok(Response::new(voicev1::CommandResponse {
+            ok: true,
+            message: "accepted".to_string(),
         }))
     }
 
@@ -1006,6 +1170,7 @@ async fn ts3_actor(
     mut audio_rx: mpsc::Receiver<OutPacket>,
     mut notice_rx: mpsc::Receiver<(i32, String)>,
     mut cmd_rx: mpsc::Receiver<OutCommand>,
+    mut avatar_rx: mpsc::Receiver<AvatarCommand>,
     events_tx: broadcast::Sender<voicev1::Event>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
@@ -1020,6 +1185,30 @@ async fn ts3_actor(
     let identity_str = get_env("TSBOT_TS3_IDENTITY", "");
     let identity_file = resolve_repo_relative(&get_env("TSBOT_TS3_IDENTITY_FILE", "./logs/identity.json"));
     let avatar_path = resolve_avatar_path_from_env();
+    let default_avatar_file: Option<PathBuf> = match avatar_path.as_ref() {
+        Some(path) if path.is_file() => Some(path.clone()),
+        Some(path) if path.is_dir() => pick_avatar_file(path),
+        _ => None,
+    };
+    let default_avatar_md5: Option<String> = default_avatar_file
+        .as_ref()
+        .and_then(|path| md5_hex_of_file(path).ok());
+    let default_avatar_size: u64 = default_avatar_file
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    match (&avatar_path, &default_avatar_file) {
+        (Some(path), None) => {
+            emit_log(
+                &events_tx,
+                3,
+                format!("avatar path has no supported image file: {}", path.display()),
+            );
+        }
+        (None, _) => {}
+        _ => {}
+    }
 
     let address = format!("{}:{}", host, port);
 
@@ -1089,6 +1278,8 @@ async fn ts3_actor(
 
     let mut out_buf: VecDeque<OutPacket> = VecDeque::with_capacity(400);
     let mut avatar_set_done = false;
+    let mut last_dynamic_avatar_md5: Option<String> = None;
+    let mut avatar_queue: VecDeque<PendingAvatarUpload> = VecDeque::new();
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(60);
 
@@ -1168,6 +1359,34 @@ async fn ts3_actor(
                 }
 
                 _ = event_tick.tick() => {
+                    if avatar_upload.is_none() {
+                        if let Some(next) = avatar_queue.pop_front() {
+                            let remote_path = avatar_remote_path(&next.md5_hex);
+                            match con.upload_file(ChannelId(0), &remote_path, None, next.size, true, false) {
+                                Ok(h) => {
+                                    emit_log(
+                                        &events_tx,
+                                        2,
+                                        format!("avatar upload started: {} -> {}", next.local_path.display(), remote_path),
+                                    );
+                                    avatar_upload = Some(AvatarUploadState {
+                                        handle: h,
+                                        local_path: next.local_path,
+                                        md5_hex: next.md5_hex,
+                                        dynamic: next.dynamic,
+                                        cleanup_local: next.cleanup_local,
+                                    });
+                                }
+                                Err(e) => {
+                                    emit_log(&events_tx, 3, format!("avatar upload start failed: {e}"));
+                                    if next.cleanup_local {
+                                        let _ = fs::remove_file(&next.local_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     loop {
                         let next_item = {
                             let mut evs = con.events();
@@ -1181,46 +1400,16 @@ async fn ts3_actor(
                                     emit_log(&events_tx, 2, "ts3 connected");
 
                                     if !avatar_set_done {
-                                        if let Some(path) = avatar_path.as_ref() {
-                                            let avatar_file = if path.is_file() {
-                                                Some(path.clone())
-                                            } else if path.is_dir() {
-                                                pick_avatar_file(path)
-                                            } else {
-                                                None
-                                            };
-
-                                            if let Some(p) = avatar_file {
-                                                match fs::metadata(&p) {
-                                                    Ok(md) => {
-                                                        let size = md.len();
-                                                        match md5_hex_of_file(&p) {
-                                                            Ok(md5_hex) => {
-                                                                let remote_path = format!("/avatar_{}", md5_hex);
-                                                                match con.upload_file(ChannelId(0), &remote_path, None, size, true, false) {
-                                                                    Ok(h) => {
-                                                                        avatar_upload = Some(AvatarUploadState { handle: h, local_path: p.clone(), md5_hex: md5_hex.clone() });
-                                                                        emit_log(&events_tx, 2, format!("avatar upload started: {} -> {}", p.display(), remote_path));
-                                                                    }
-                                                                    Err(e) => {
-                                                                        emit_log(&events_tx, 3, format!("avatar upload start failed: {e}"));
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                emit_log(&events_tx, 3, format!("avatar md5 failed: {e}"));
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        emit_log(&events_tx, 3, format!("avatar stat failed: {e}"));
-                                                    }
-                                                }
-                                            } else if path.is_dir() {
-                                                emit_log(&events_tx, 3, format!("avatar dir has no supported images: {}", path.display()));
-                                            } else {
-                                                emit_log(&events_tx, 3, format!("avatar path not found: {}", path.display()));
-                                            }
+                                        if let (Some(path), Some(md5_hex)) =
+                                            (default_avatar_file.as_ref(), default_avatar_md5.as_ref())
+                                        {
+                                            avatar_queue.push_back(PendingAvatarUpload {
+                                                local_path: path.clone(),
+                                                md5_hex: md5_hex.clone(),
+                                                size: default_avatar_size,
+                                                dynamic: false,
+                                                cleanup_local: false,
+                                            });
                                         }
                                     }
                                 }
@@ -1275,12 +1464,17 @@ async fn ts3_actor(
                                     if st.handle.0 == h.0 {
                                         let local_path = st.local_path.clone();
                                         let md5_hex = st.md5_hex.clone();
+                                        let dynamic = st.dynamic;
+                                        let cleanup_local = st.cleanup_local;
 
                                         match tokio::fs::File::open(&local_path).await {
                                             Ok(mut file) => {
                                                 let mut stream = r.stream;
                                                 if let Err(e) = tokio::io::copy(&mut file, &mut stream).await {
                                                     emit_log(&events_tx, 3, format!("upload avatar failed: {e}"));
+                                                    if cleanup_local {
+                                                        let _ = fs::remove_file(&local_path);
+                                                    }
                                                     avatar_upload = None;
                                                     continue;
                                                 }
@@ -1295,17 +1489,47 @@ async fn ts3_actor(
                                                 if let Ok(client) = con.get_tsproto_client_mut() {
                                                     if let Err(e) = client.send_packet(cmd.into_packet()) {
                                                         emit_log(&events_tx, 3, format!("set avatar flag failed: {e}"));
+                                                        if cleanup_local {
+                                                            let _ = fs::remove_file(&local_path);
+                                                        }
                                                         avatar_upload = None;
                                                         continue;
                                                     }
                                                 }
 
                                                 emit_log(&events_tx, 2, format!("avatar updated: {}", md5_hex));
-                                                avatar_set_done = true;
+                                                let previous_dynamic = last_dynamic_avatar_md5.clone();
+                                                if dynamic {
+                                                    last_dynamic_avatar_md5 = Some(md5_hex.clone());
+                                                } else {
+                                                    avatar_set_done = true;
+                                                    last_dynamic_avatar_md5 = None;
+                                                }
+                                                if cleanup_local {
+                                                    let _ = fs::remove_file(&local_path);
+                                                }
                                                 avatar_upload = None;
+
+                                                if let Some(prev) = previous_dynamic {
+                                                    let keep = prev == md5_hex
+                                                        || default_avatar_md5.as_deref() == Some(prev.as_str());
+                                                    if !keep {
+                                                        let host = get_env("TSBOT_TS3_HOST", "127.0.0.1");
+                                                        let port = get_env("TSBOT_TS3_FILETRANSFER_PORT", "30033")
+                                                            .trim()
+                                                            .parse::<u16>()
+                                                            .unwrap_or(30033);
+                                                        tokio::spawn(async move {
+                                                            filetransfer_delete_avatar(&host, port, &prev).await;
+                                                        });
+                                                    }
+                                                }
                                             }
                                             Err(e) => {
                                                 emit_log(&events_tx, 3, format!("open avatar file failed: {e}"));
+                                                if cleanup_local {
+                                                    let _ = fs::remove_file(&local_path);
+                                                }
                                                 avatar_upload = None;
                                             }
                                         }
@@ -1317,6 +1541,10 @@ async fn ts3_actor(
                                 if let Some(st) = avatar_upload.as_ref() {
                                     if st.handle.0 == h.0 {
                                         emit_log(&events_tx, 3, format!("avatar filetransfer failed: {e}"));
+                                        if st.cleanup_local {
+                                            let path = st.local_path.clone();
+                                            let _ = fs::remove_file(&path);
+                                        }
                                         avatar_upload = None;
                                     }
                                 }
@@ -1430,6 +1658,46 @@ async fn ts3_actor(
                         }
                     } else {
                         break 'outer;
+                    }
+                }
+
+                avatar_cmd = avatar_rx.recv() => {
+                    match avatar_cmd {
+                        Some(AvatarCommand::Set { local_path, md5_hex }) => {
+                            let size = fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
+                            if size == 0 {
+                                emit_log(&events_tx, 3, "avatar upload skipped: empty image".to_string());
+                                let _ = fs::remove_file(&local_path);
+                            } else {
+                                avatar_queue.push_back(PendingAvatarUpload {
+                                    local_path,
+                                    md5_hex,
+                                    size,
+                                    dynamic: true,
+                                    cleanup_local: true,
+                                });
+                            }
+                        }
+                        Some(AvatarCommand::Restore) => {
+                            if let (Some(path), Some(md5_hex)) =
+                                (default_avatar_file.as_ref(), default_avatar_md5.as_ref())
+                            {
+                                avatar_queue.push_back(PendingAvatarUpload {
+                                    local_path: path.clone(),
+                                    md5_hex: md5_hex.clone(),
+                                    size: default_avatar_size,
+                                    dynamic: false,
+                                    cleanup_local: false,
+                                });
+                            } else {
+                                emit_log(
+                                    &events_tx,
+                                    3,
+                                    "avatar restore skipped: no default avatar configured".to_string(),
+                                );
+                            }
+                        }
+                        None => break 'outer,
                     }
                 }
 
@@ -1920,6 +2188,7 @@ async fn main() -> Result<()> {
     let (ts3_audio_tx, ts3_audio_rx) = mpsc::channel::<OutPacket>(200);
     let (ts3_notice_tx, ts3_notice_rx) = mpsc::channel::<(i32, String)>(50);
     let (ts3_cmd_tx, ts3_cmd_rx) = mpsc::channel::<OutCommand>(50);
+    let (ts3_avatar_tx, ts3_avatar_rx) = mpsc::channel::<AvatarCommand>(32);
 
     let (events_tx, _events_rx) = broadcast::channel::<voicev1::Event>(512);
 
@@ -1958,7 +2227,16 @@ async fn main() -> Result<()> {
         let events_tx_clone = events_tx.clone();
         let shutdown_token_clone = shutdown_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = ts3_actor(ts3_audio_rx, ts3_notice_rx, ts3_cmd_rx, events_tx_clone, shutdown_token_clone).await {
+            if let Err(e) = ts3_actor(
+                ts3_audio_rx,
+                ts3_notice_rx,
+                ts3_cmd_rx,
+                ts3_avatar_rx,
+                events_tx_clone,
+                shutdown_token_clone,
+            )
+            .await
+            {
                 error!(%e, "ts3 actor exited");
             }
         })
@@ -2044,6 +2322,7 @@ async fn main() -> Result<()> {
         ts3_audio_tx,
         ts3_notice_tx,
         ts3_cmd_tx,
+        ts3_avatar_tx,
         events_tx,
         persist_tx,
     };

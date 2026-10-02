@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     web_log_level: str = "INFO"
     voice_description_title: str = "Yumi TSBot"
     voice_description_intro: str = "TeamSpeak 音乐机器人\\n支持网易云 / QQ 音乐 / B站"
+    voice_cover_avatar_enabled: bool = True
+    voice_lyric_nickname_enabled: bool = True
+    voice_lyric_update_interval_ms: int = 2000
+    ts3_filetransfer_port: int = 30033
+    ts3_nickname: str = "tsbot"
     bilibili_max_duration_minutes: int = 180
     bilibili_audio_cache_ttl_hours: int = 72
     bilibili_audio_cache_max_mb: int = 2048

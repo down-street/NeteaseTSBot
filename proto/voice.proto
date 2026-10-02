@@ -17,6 +17,8 @@ service VoiceService {
   rpc SendNotice(NoticeRequest) returns (CommandResponse);
 
   rpc SetClientDescription(SetClientDescriptionRequest) returns (CommandResponse);
+  rpc SetClientNickname(SetClientNicknameRequest) returns (CommandResponse);
+  rpc SetClientAvatar(SetClientAvatarRequest) returns (CommandResponse);
 
   rpc SetVolume(SetVolumeRequest) returns (CommandResponse);
   rpc GetStatus(Empty) returns (StatusResponse);
@@ -58,6 +60,17 @@ message NoticeRequest {
 
 message SetClientDescriptionRequest {
   string description = 1;
+}
+
+message SetClientNicknameRequest {
+  string nickname = 1;
+}
+
+message SetClientAvatarRequest {
+  // Raw image bytes for the client avatar. When empty or restore_default is set,
+  // the configured default avatar is restored instead.
+  bytes image = 1;
+  bool restore_default = 2;
 }
 
 message StatusResponse {

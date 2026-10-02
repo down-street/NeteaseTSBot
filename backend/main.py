@@ -404,6 +404,10 @@ async def _set_now_playing_queue_item(
             _current_artwork_url = (artwork_url or "").strip()
 
     _schedule_ts_description_update()
+    if item_id is None:
+        await _on_ts_playback_stopped()
+    else:
+        await _on_ts_playback_started(int(item_id), artwork_url)
 
 
 async def _build_ts_description(*, queue_preview: int = 5) -> str:
@@ -517,24 +521,27 @@ async def _take_now_playing_if_match(*, source_url: str) -> int | None:
     global _current_queue_item_id, _current_source_url, _play_started_at, _paused_at, _paused_total_s, _current_duration_ms
     global _current_artist, _current_album, _current_artwork_url
     src = (source_url or "").strip()
+    matched = False
     async with _playback_lock:
-        if not _current_queue_item_id:
-            return None
-        if not _current_source_url:
-            return None
-        if src != _current_source_url:
-            return None
-        item_id = _current_queue_item_id
-        _current_queue_item_id = None
-        _current_source_url = ""
-        _play_started_at = None
-        _paused_at = None
-        _paused_total_s = 0.0
-        _current_duration_ms = 0
-        _current_artist = ""
-        _current_album = ""
-        _current_artwork_url = ""
+        if _current_queue_item_id and _current_source_url and src == _current_source_url:
+            item_id = _current_queue_item_id
+            _current_queue_item_id = None
+            _current_source_url = ""
+            _play_started_at = None
+            _paused_at = None
+            _paused_total_s = 0.0
+            _current_duration_ms = 0
+            _current_artist = ""
+            _current_album = ""
+            _current_artwork_url = ""
+            matched = True
+        else:
+            item_id = None
+
+    if matched and item_id is not None:
+        await _on_ts_playback_stopped()
         return item_id
+    return None
 
 
 async def _begin_play_request(item_id: int | None = None) -> int:
@@ -601,6 +608,7 @@ async def _mark_playback_paused() -> None:
         _paused_at = time.monotonic()
 
     _schedule_ts_description_update()
+    await _on_ts_playback_paused()
 
 
 async def _mark_playback_resumed() -> None:
@@ -614,6 +622,7 @@ async def _mark_playback_resumed() -> None:
         _paused_at = None
 
     _schedule_ts_description_update()
+    await _on_ts_playback_resumed_or_seeked()
 
 
 async def _mark_playback_seeked(position_s: float) -> None:
@@ -629,6 +638,7 @@ async def _mark_playback_seeked(position_s: float) -> None:
             _paused_at = now
 
     _schedule_ts_description_update()
+    await _on_ts_playback_resumed_or_seeked()
 
 
 def _resolve_playback_position_s(*, now_s: float, started_at: float, paused_at: float | None, paused_total_s: float) -> float:
@@ -637,6 +647,296 @@ def _resolve_playback_position_s(*, now_s: float, started_at: float, paused_at: 
     else:
         pos = now_s - started_at - paused_total_s
     return max(0.0, pos)
+
+
+_TS_NICKNAME_MAX_CHARS = 30
+_TS_NICKNAME_PREFIX = "♪ "
+_TS_AVATAR_MAX_EDGE = 128
+_TS_AVATAR_MAX_BYTES = 100 * 1024
+_TS_AVATAR_CACHE_MAX_ITEMS = 32
+
+_ts_presence_generation: int = 0
+_ts_lyric_task: asyncio.Task[None] | None = None
+_ts_last_nickname: str = ""
+_ts_avatar_cache: dict[str, bytes] = {}
+
+
+def _ts_base_nickname() -> str:
+    base = str(getattr(settings, "ts3_nickname", "") or "").strip()
+    return base or "tsbot"
+
+
+def _format_ts_scrolling_nickname(title: str, lyric_line: str, artist: str = "") -> str:
+    t = (title or "").strip() or "未知曲目"
+    line = (lyric_line or "").strip()
+    if line:
+        text = f"{_TS_NICKNAME_PREFIX}{t} - {line}"
+    else:
+        a = (artist or "").strip()
+        text = f"{_TS_NICKNAME_PREFIX}{t} - {a}" if a else f"{_TS_NICKNAME_PREFIX}{t}"
+    compact = " ".join(text.split())
+    return compact[:_TS_NICKNAME_MAX_CHARS]
+
+
+def _lyric_line_at(lyrics: list[LyricLine], position_s: float) -> str:
+    current = ""
+    for entry in lyrics:
+        if entry.time <= position_s + 0.15:
+            current = entry.text
+        else:
+            break
+    return current
+
+
+def _bump_ts_presence_generation() -> int:
+    global _ts_presence_generation, _ts_lyric_task
+    _ts_presence_generation += 1
+    task = _ts_lyric_task
+    _ts_lyric_task = None
+    if task is not None and not task.done():
+        task.cancel()
+    return _ts_presence_generation
+
+
+def _ts_lyric_nickname_enabled() -> bool:
+    return bool(getattr(settings, "voice_lyric_nickname_enabled", True))
+
+
+def _ts_cover_avatar_enabled() -> bool:
+    return bool(getattr(settings, "voice_cover_avatar_enabled", True))
+
+
+def _ts_lyric_interval_s() -> float:
+    try:
+        raw = float(getattr(settings, "voice_lyric_update_interval_ms", 2000))
+    except (TypeError, ValueError):
+        raw = 2000.0
+    return max(0.5, min(30.0, raw / 1000.0))
+
+
+async def _restore_ts_nickname(generation: int) -> None:
+    global _ts_last_nickname
+    if generation != _ts_presence_generation:
+        return
+    base = _ts_base_nickname()
+    if _ts_last_nickname == base:
+        return
+    try:
+        await voice.set_client_nickname(base)
+        _ts_last_nickname = base
+    except Exception as exc:
+        logger.info("ts3 nickname restore skipped: %s", exc)
+
+
+async def _restore_ts_default_avatar(generation: int) -> None:
+    if generation != _ts_presence_generation:
+        return
+    try:
+        await voice.set_client_avatar(restore_default=True)
+    except Exception as exc:
+        logger.info("ts3 avatar restore skipped: %s", exc)
+
+
+async def _ts_lyric_worker(item_id: int, generation: int) -> None:
+    global _ts_last_nickname
+    try:
+        session = new_session()
+        try:
+            item = session.get(QueueItem, int(item_id))
+            title = (item.title or "").strip() if item else ""
+            artist = (item.artist or "").strip() if item else ""
+        finally:
+            session.close()
+        if not title:
+            return
+
+        lyrics = await _fetch_lyrics_for_item(int(item_id))
+        last_display = ""
+        interval = _ts_lyric_interval_s()
+
+        while True:
+            if generation != _ts_presence_generation:
+                return
+            if not _ts_lyric_nickname_enabled():
+                return
+
+            async with _playback_lock:
+                if _current_queue_item_id != int(item_id):
+                    return
+                started_at = _play_started_at
+                paused_at = _paused_at
+                paused_total_s = _paused_total_s
+
+            if started_at is None:
+                return
+            if paused_at is not None:
+                await asyncio.sleep(interval)
+                continue
+
+            position_s = _resolve_playback_position_s(
+                now_s=time.monotonic(),
+                started_at=started_at,
+                paused_at=None,
+                paused_total_s=paused_total_s,
+            )
+            current_line = _lyric_line_at(lyrics, position_s)
+
+            display = _format_ts_scrolling_nickname(title, current_line, artist)
+            if display and display != last_display:
+                try:
+                    await voice.set_client_nickname(display)
+                    last_display = display
+                    _ts_last_nickname = display
+                except Exception as exc:
+                    logger.warning("ts3 lyric nickname update failed, disabling: %s", exc)
+                    return
+
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.info("ts3 lyric worker stopped: %s", exc)
+
+
+def _start_ts_lyric_worker(item_id: int, generation: int) -> None:
+    global _ts_lyric_task
+    if not _ts_lyric_nickname_enabled():
+        return
+    _ts_lyric_task = asyncio.create_task(_ts_lyric_worker(int(item_id), generation))
+
+
+async def _on_ts_playback_started(item_id: int, artwork_url: str) -> None:
+    generation = _bump_ts_presence_generation()
+    if _ts_lyric_nickname_enabled():
+        _start_ts_lyric_worker(int(item_id), generation)
+    if _ts_cover_avatar_enabled():
+        asyncio.create_task(_apply_ts_cover_avatar(generation, artwork_url))
+
+
+async def _on_ts_playback_stopped() -> None:
+    generation = _bump_ts_presence_generation()
+    asyncio.create_task(_restore_ts_nickname(generation))
+    if _ts_cover_avatar_enabled():
+        asyncio.create_task(_restore_ts_default_avatar(generation))
+
+
+async def _on_ts_playback_paused() -> None:
+    generation = _bump_ts_presence_generation()
+    asyncio.create_task(_restore_ts_nickname(generation))
+
+
+async def _on_ts_playback_resumed_or_seeked() -> None:
+    async with _playback_lock:
+        item_id = _current_queue_item_id
+    generation = _bump_ts_presence_generation()
+    if item_id is not None:
+        _start_ts_lyric_worker(int(item_id), generation)
+
+
+def _ts_avatar_request_headers(url: str) -> dict[str, str]:
+    lowered = (url or "").lower()
+    if "bilibili" in lowered or "hdslb" in lowered:
+        return dict(_BILIBILI_DEFAULT_HEADERS)
+    return {"User-Agent": "Mozilla/5.0 (compatible; TSBot/1.0)"}
+
+
+def _resize_ts_avatar(raw: bytes) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image
+
+    try:
+        image = Image.open(BytesIO(raw))
+        image.load()
+    except Exception:
+        return b""
+
+    image = image.convert("RGBA")
+    image.thumbnail((_TS_AVATAR_MAX_EDGE, _TS_AVATAR_MAX_EDGE), Image.LANCZOS)
+
+    has_alpha = image.getchannel("A").getextrema()[0] < 255
+    if has_alpha:
+        buffer = BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        data = buffer.getvalue()
+        if len(data) <= _TS_AVATAR_MAX_BYTES:
+            return data
+
+    rgb = image.convert("RGB")
+    for quality in (85, 70, 50):
+        buffer = BytesIO()
+        rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
+        data = buffer.getvalue()
+        if len(data) <= _TS_AVATAR_MAX_BYTES:
+            return data
+
+    rgb.thumbnail((64, 64), Image.LANCZOS)
+    buffer = BytesIO()
+    rgb.save(buffer, format="JPEG", quality=70, optimize=True)
+    data = buffer.getvalue()
+    return data if len(data) <= _TS_AVATAR_MAX_BYTES else b""
+
+
+async def _fetch_ts_avatar_bytes(url: str) -> bytes:
+    key = (url or "").strip()
+    if not key:
+        return b""
+    cached = _ts_avatar_cache.get(key)
+    if cached:
+        return cached
+
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        resp = await client.get(key, headers=_ts_avatar_request_headers(key))
+    if resp.status_code != 200 or not resp.content:
+        raise RuntimeError(f"cover download failed: status={resp.status_code}")
+
+    data = _resize_ts_avatar(resp.content)
+    if not data:
+        raise RuntimeError("cover image could not be processed")
+
+    if len(_ts_avatar_cache) >= _TS_AVATAR_CACHE_MAX_ITEMS:
+        _ts_avatar_cache.clear()
+    _ts_avatar_cache[key] = data
+    return data
+
+
+async def _apply_ts_cover_avatar(generation: int, artwork_url: str) -> None:
+    if generation != _ts_presence_generation:
+        return
+    if not _ts_cover_avatar_enabled():
+        return
+    url = (artwork_url or "").strip()
+    if not url:
+        return
+    try:
+        data = await _fetch_ts_avatar_bytes(url)
+        if generation != _ts_presence_generation:
+            return
+        if not data:
+            return
+        await voice.set_client_avatar(data)
+    except Exception as exc:
+        logger.info("ts3 cover avatar skipped: %s", exc)
+
+
+async def _reconcile_ts_presence() -> None:
+    """Re-apply or tear down now-playing presence after a settings change."""
+    async with _playback_lock:
+        item_id = _current_queue_item_id
+        paused = _paused_at is not None
+        artwork_url = _current_artwork_url or ""
+
+    generation = _bump_ts_presence_generation()
+
+    if item_id is None or paused or not _ts_lyric_nickname_enabled():
+        asyncio.create_task(_restore_ts_nickname(generation))
+    else:
+        _start_ts_lyric_worker(int(item_id), generation)
+
+    if item_id is None or not _ts_cover_avatar_enabled():
+        asyncio.create_task(_restore_ts_default_avatar(generation))
+    else:
+        asyncio.create_task(_apply_ts_cover_avatar(generation, artwork_url))
 
 
 async def _hydrate_bilibili_track_metadata(
@@ -1155,7 +1455,7 @@ def _normalize_qqmusic_song(song: dict) -> dict | None:
         "source": "qqmusic",
         "track_id": f"qqmusic:{song_mid}",
         "song_mid": song_mid,
-        "title": str(song.get("name") or song_mid).strip(),
+        "title": str(song.get("name") or song.get("songname") or song_mid).strip(),
         "artist": _extract_qqmusic_artist_names(song),
         "album": album_name,
         "album_mid": album_mid,
@@ -2798,8 +3098,7 @@ def _parse_lrc_to_lines(lrc: str) -> list[LyricLine]:
     return lines
 
 
-@app.get("/lyrics/{queue_item_id}", response_model=LyricsResponse)
-async def lyrics(queue_item_id: int) -> LyricsResponse:
+async def _fetch_lyrics_for_item(queue_item_id: int) -> list[LyricLine]:
     session = new_session()
     try:
         item = session.get(QueueItem, queue_item_id)
@@ -2827,7 +3126,7 @@ async def lyrics(queue_item_id: int) -> LyricsResponse:
 
         data = await netease.lyric(song_id=song_id, cookie=cookie)
         lrc = (((data or {}).get("lrc") or {}).get("lyric") or "")
-        return LyricsResponse(lyrics=_parse_lrc_to_lines(str(lrc)))
+        return _parse_lrc_to_lines(str(lrc))
     
     elif track_id.startswith("qqmusic:"):
         # QQ 音乐歌词
@@ -2844,19 +3143,24 @@ async def lyrics(queue_item_id: int) -> LyricsResponse:
             # 获取 QQ 音乐歌词
             data = await qqmusic.get_song_lyric(song_mid)
             lrc = data.get("lyric", "") if data else ""
-            return LyricsResponse(lyrics=_parse_lrc_to_lines(str(lrc)))
+            return _parse_lrc_to_lines(str(lrc))
         except Exception:
-            return LyricsResponse(lyrics=[])
+            return []
 
     elif track_id.startswith("bilibili:"):
         video_id = _extract_bilibili_video_id(track_id.split(":", 1)[1])
         if not video_id:
-            return LyricsResponse(lyrics=[])
+            return []
         lyrics = await _fetch_bilibili_lyrics(video_id, title=title, artist=artist)
-        return LyricsResponse(lyrics=lyrics)
+        return lyrics
     
     else:
-        return LyricsResponse(lyrics=[])
+        return []
+
+
+@app.get("/lyrics/{queue_item_id}", response_model=LyricsResponse)
+async def lyrics(queue_item_id: int) -> LyricsResponse:
+    return LyricsResponse(lyrics=await _fetch_lyrics_for_item(queue_item_id))
 
 
 @app.get("/playlist/detail")
@@ -3149,18 +3453,19 @@ def _format_help() -> str:
         "Commands (no prefix):\n"
         "帮助|help - show this help\n"
         "状态|now - show now playing\n"
-        "搜索|search <keywords> - search songs\n"
-        "增加|add <song_id|keywords> - add to queue\n"
-        "播放|play [song_id|keywords] - play now; no argument plays the first queue item\n"
+        "搜索|search [qq|bili] <keywords> - search songs/videos\n"
+        "增加|add [qq|bili] <id|keywords> - add to queue\n"
+        "播放|play [qq|bili] [id|keywords] - play now; no argument plays the first queue item\n"
         "队列|queue - show queue\n"
-        "歌单|playlist <keywords> - search Netease playlists\n"
+        "歌单|playlist [qq] <keywords> - search playlists\n"
         "选择|select <number> - add a playlist from the last playlist search\n"
         "清空|clear - clear the current queue\n"
         "顺序播放|order / 随机播放|random - switch queue playback mode\n"
         "暂停|pause / 恢复|resume / 停止|stop / 跳过|skip\n"
         "音量|vol <0-200> - set volume\n"
         "音效|fx - show audio fx\n"
-        "fx pan <-1..1> / fx width <0..3> / fx swap <on|off> / fx bass <0..18> / fx reverb <0..1> / fx reset"
+        "fx pan <-1..1> / fx width <0..3> / fx swap <on|off> / fx bass <0..18> / fx reverb <0..1> / fx reset\n"
+        "Tips: qq/bili select the source; BV ids and Bilibili/QQ share links are auto-detected"
     )
 
 
@@ -3569,6 +3874,212 @@ async def _enqueue_bilibili_song(
         session.close()
 
 
+_CHAT_SOURCE_ALIASES = {
+    "qq": "qqmusic",
+    "qqmusic": "qqmusic",
+    "qq音乐": "qqmusic",
+    "bili": "bilibili",
+    "bilibili": "bilibili",
+    "b站": "bilibili",
+    "哔哩哔哩": "bilibili",
+    "netease": "netease",
+    "网易": "netease",
+    "网易云": "netease",
+    "wy": "netease",
+}
+
+_CHAT_SOURCE_LABELS = {
+    "netease": "网易云",
+    "qqmusic": "QQ音乐",
+    "bilibili": "B站",
+}
+
+_QQ_SONGMID_RE = re.compile(r"^[0-9A-Za-z]{14}$")
+_CHAT_COMPACT_SOURCE_RE = re.compile(r"^([A-Za-z\u4e00-\u9fff]{1,8})[::](.+)$")
+_BILIBILI_CHAT_URL_RE = re.compile(r"(bilibili\.com|b23\.tv)", re.IGNORECASE)
+_QQ_CHAT_URL_RE = re.compile(r"(y\.qq\.com|c\.y\.qq\.com|i\.y\.qq\.com)", re.IGNORECASE)
+
+
+def _detect_chat_source(text: str) -> str:
+    raw = (text or "").strip()
+    if _BILIBILI_CHAT_URL_RE.search(raw) or _BILIBILI_VIDEO_ID_RE.fullmatch(raw):
+        return "bilibili"
+    if _QQ_CHAT_URL_RE.search(raw):
+        return "qqmusic"
+    return "netease"
+
+
+def _parse_chat_source(arg: str) -> tuple[str, str]:
+    """Split an optional source selector from a chat argument.
+
+    Accepts a leading token ("qq 稻香", "bili BV1xx"), a compact form
+    ("qq:稻香"), or no selector at all (auto-detect links, default Netease).
+    """
+    text = (arg or "").strip()
+    if not text:
+        return "netease", ""
+
+    compact = _CHAT_COMPACT_SOURCE_RE.match(text)
+    if compact:
+        source = _CHAT_SOURCE_ALIASES.get(compact.group(1).strip().lower())
+        if source and compact.group(2).strip():
+            return source, compact.group(2).strip()
+
+    for separator in (" ", "\t"):
+        if separator in text:
+            head, _, tail = text.partition(separator)
+            source = _CHAT_SOURCE_ALIASES.get(head.strip().lower())
+            if source and tail.strip():
+                return source, tail.strip()
+
+    return _detect_chat_source(text), text
+
+
+def _extract_query_qq_songmid(text: str) -> str:
+    raw = (text or "").strip()
+    if _QQ_SONGMID_RE.match(raw):
+        return raw
+    match = re.search(r"songmid=([0-9A-Za-z]{14})", raw, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    match = re.search(r"/songDetail/([0-9A-Za-z]{14})", raw, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _normalize_qqmusic_playlist(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    playlist_id = str(item.get("dissid") or item.get("tid") or item.get("id") or "").strip()
+    if not playlist_id:
+        return None
+    creator = item.get("creator")
+    if isinstance(creator, dict):
+        creator_name = str(creator.get("name") or creator.get("nick") or "").strip()
+    else:
+        creator_name = str(creator or "").strip()
+    track_count = item.get("song_count")
+    if track_count in (None, ""):
+        track_count = item.get("songnum")
+    return {
+        "source": "qqmusic",
+        "id": playlist_id,
+        "name": str(item.get("dissname") or item.get("name") or "").strip() or playlist_id,
+        "creator": creator_name,
+        "track_count": str(track_count or "").strip(),
+        "cover": str(item.get("imgurl") or item.get("cover") or "").strip(),
+    }
+
+
+def _normalize_qqmusic_playlist_items(items: list[dict]) -> list[dict]:
+    playlists: list[dict] = []
+    for item in items:
+        normalized = _normalize_qqmusic_playlist(item)
+        if normalized is not None:
+            playlists.append(normalized)
+    return playlists
+
+
+async def _chat_search_qqmusic(query: str, limit: int = 5) -> list[dict]:
+    songs = await qqmusic.search_songs_simple(query, limit=limit, page=1)
+    return _normalize_qqmusic_search_items(songs)
+
+
+async def _chat_search_bilibili(query: str, limit: int = 5) -> list[dict]:
+    result = await _bilibili_search_videos(keywords=query, limit=limit, page=1)
+    items = result.get("items") or []
+    return [item for item in items if isinstance(item, dict)]
+
+
+async def _chat_enqueue_qqmusic(query: str, *, play_now: bool, requested_by: str) -> tuple[int, str, str]:
+    song_mid = _extract_query_qq_songmid(query)
+    title = ""
+    artist = ""
+    album_mid = ""
+    duration_ms: int | None = None
+
+    if not song_mid:
+        items = await _chat_search_qqmusic(query, limit=1)
+        if not items:
+            raise HTTPException(status_code=404, detail="没有找到QQ音乐歌曲")
+        first = items[0]
+        song_mid = str(first.get("song_mid") or "").strip()
+        title = str(first.get("title") or "").strip()
+        artist = str(first.get("artist") or "").strip()
+        album_mid = str(first.get("album_mid") or "").strip()
+        duration_ms = _coerce_positive_int(first.get("duration_ms"))
+    if not song_mid:
+        raise HTTPException(status_code=404, detail="没有找到QQ音乐歌曲")
+    if not title:
+        title = song_mid
+
+    try:
+        item_id, _trial = await _enqueue_qqmusic_song(
+            song_mid=song_mid,
+            title=title,
+            artist=artist,
+            play_now=play_now,
+            requested_by=requested_by,
+            album_mid=album_mid,
+            duration_ms=duration_ms,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 400 and "qqmusic cookie" in str(exc.detail):
+            raise HTTPException(
+                status_code=409,
+                detail="QQ 音乐未授权：请先在 Web 控制台完成 QQ 音乐登录",
+            ) from exc
+        raise
+    return int(item_id), title, artist
+
+
+async def _chat_enqueue_bilibili(query: str, *, play_now: bool, requested_by: str) -> tuple[int, str, str]:
+    video_id = _extract_bilibili_video_id(query)
+    title = ""
+    artist = ""
+    album = ""
+    duration_ms: int | None = None
+    artwork_url = ""
+
+    if not video_id:
+        items = await _chat_search_bilibili(query, limit=1)
+        if not items:
+            raise HTTPException(status_code=404, detail="没有找到B站视频")
+        first = items[0]
+        video_id = _extract_bilibili_video_id(first.get("video_id"))
+        title = str(first.get("title") or "").strip()
+        artist = str(first.get("artist") or "").strip()
+        album = str(first.get("album") or "").strip()
+        duration_ms = _coerce_positive_int(first.get("duration_ms"))
+        artwork_url = str(first.get("artwork_url") or "").strip()
+    if not video_id:
+        raise HTTPException(status_code=404, detail="没有找到B站视频")
+
+    if not title:
+        try:
+            info = await _extract_bilibili_video_info(video_id)
+        except HTTPException:
+            info = {}
+        title = str((info or {}).get("title") or video_id).strip()
+        artist = artist or str((info or {}).get("artist") or "").strip()
+        album = album or str((info or {}).get("album") or "").strip()
+        duration_ms = duration_ms or _coerce_positive_int((info or {}).get("duration_ms"))
+        artwork_url = artwork_url or str((info or {}).get("artwork_url") or "").strip()
+
+    item_id, _trial = await _enqueue_bilibili_song(
+        video_id=video_id,
+        title=title or video_id,
+        artist=artist,
+        play_now=play_now,
+        requested_by=requested_by,
+        album=album,
+        duration_ms=duration_ms,
+        artwork_url=artwork_url,
+    )
+    return int(item_id), title or video_id, artist
+
+
 async def _handle_chat_command(
     invoker_name: str,
     message: str,
@@ -3761,12 +4272,27 @@ async def _handle_chat_command(
 
         if cmd == "playlist":
             if not arg:
-                await reply("用法: playlist <歌单关键词>")
+                await reply("用法: playlist [qq] <歌单关键词>")
                 return
-            raw = await netease.search(keywords=arg, limit=5, type_=1000)
-            playlists = _extract_playlist_search_items(raw)
+            source, query = _parse_chat_source(arg)
+            if source == "bilibili":
+                await reply("B站暂不支持歌单搜索，可直接用 bili <关键词|BV号> 点播视频")
+                return
+            if not query:
+                await reply("用法: playlist [qq] <歌单关键词>")
+                return
+            if source == "qqmusic":
+                raw_playlists = await qqmusic.search_playlists_simple(query, limit=5, page=1)
+                playlists = _normalize_qqmusic_playlist_items(raw_playlists)
+                label = "QQ音乐"
+            else:
+                raw = await netease.search(keywords=query, limit=5, type_=1000)
+                playlists = _extract_playlist_search_items(raw)
+                for playlist in playlists:
+                    playlist.setdefault("source", "netease")
+                label = "网易云"
             if not playlists:
-                await reply("没有找到网易云歌单")
+                await reply(f"没有找到{label}歌单")
                 return
             _remember_ts_playlist_results(invoker_key, playlists)
             lines: list[str] = []
@@ -3780,7 +4306,7 @@ async def _handle_chat_command(
                 if track_count:
                     suffix += f" ({track_count}首)"
                 lines.append(f"{index}. {detail}{suffix} [id={playlist['id']}]")
-            await reply("网易云歌单搜索结果（使用 select <编号> 加入队列）：\n" + "\n".join(lines))
+            await reply(f"{label}歌单搜索结果（使用 select <编号> 加入队列）：\n" + "\n".join(lines))
             return
 
         if cmd == "select":
@@ -3805,6 +4331,52 @@ async def _handle_chat_command(
                 await reply("歌单编号无效，请先使用 playlist 搜索")
                 return
             playlist_id = selected_playlist["id"]
+            playlist_source = str(selected_playlist.get("source") or "netease").strip().lower()
+
+            if playlist_source == "qqmusic":
+                tracks = await qqmusic.get_song_list_simple(playlist_id)
+                if not tracks:
+                    await reply("歌单为空，或 QQ 音乐未返回可用歌曲")
+                    return
+                added = 0
+                failed = 0
+                for track in tracks:
+                    normalized = _normalize_qqmusic_song(track) if isinstance(track, dict) else None
+                    if normalized is None:
+                        failed += 1
+                        continue
+                    try:
+                        await _enqueue_qqmusic_song(
+                            song_mid=str(normalized["song_mid"]),
+                            title=str(normalized["title"]),
+                            artist=str(normalized["artist"]),
+                            play_now=False,
+                            requested_by=invoker_name,
+                            album_mid=str(normalized.get("album_mid") or ""),
+                            duration_ms=normalized.get("duration_ms"),
+                        )
+                        added += 1
+                    except Exception:
+                        failed += 1
+
+                auto_started = False
+                if added:
+                    try:
+                        st = await voice.get_status()
+                        cur = str(getattr(st, "state", "") or "").strip().upper()
+                        if cur == "STATE_IDLE":
+                            await _auto_play_next_from_queue()
+                            auto_started = True
+                    except Exception:
+                        pass
+                label = selected_playlist.get("name") or playlist_id
+                status = f"已从QQ音乐歌单《{label}》加入 {added} 首歌曲"
+                if failed:
+                    status += f"，{failed} 首失败"
+                if auto_started:
+                    status += "，已开始播放"
+                await reply(status)
+                return
 
             cookie = _get_admin_cookie_or_none()
             detail = await netease.playlist_detail(playlist_id=playlist_id, cookie=cookie)
@@ -4005,20 +4577,38 @@ async def _handle_chat_command(
 
         if cmd == "search":
             if not arg:
-                await reply("用法: search <关键词>")
+                await reply("用法: search [qq|bili] <关键词>")
                 return
-            raw = await netease.search(keywords=arg, limit=5)
-            songs = (((raw or {}).get("result") or {}).get("songs") or [])
-            if not songs:
-                await reply("没有找到结果")
+            source, query = _parse_chat_source(arg)
+            if not query:
+                await reply("用法: search [qq|bili] <关键词>")
                 return
             lines: list[str] = []
-            for i, s in enumerate(songs[:5], start=1):
-                sid = str((s or {}).get("id") or "")
-                title = str((s or {}).get("name") or "")
-                artist = _extract_netease_artist_names(s or {}) if isinstance(s, dict) else ""
-                lines.append(f"{i}. {sid} {title} - {artist}".strip())
-            await reply("搜索结果(可直接用 add/play + 歌曲ID):\n" + "\n".join(lines))
+            if source == "qqmusic":
+                for i, item in enumerate((await _chat_search_qqmusic(query, limit=5))[:5], start=1):
+                    lines.append(
+                        f"{i}. {item.get('song_mid', '')} {item.get('title', '')} - {item.get('artist', '')}".strip(" -")
+                    )
+            elif source == "bilibili":
+                for i, item in enumerate((await _chat_search_bilibili(query, limit=5))[:5], start=1):
+                    lines.append(
+                        f"{i}. {item.get('video_id', '')} {item.get('title', '')} - {item.get('artist', '')}".strip(" -")
+                    )
+            else:
+                raw = await netease.search(keywords=query, limit=5)
+                songs = (((raw or {}).get("result") or {}).get("songs") or [])
+                for i, s in enumerate(songs[:5], start=1):
+                    sid = str((s or {}).get("id") or "")
+                    title = str((s or {}).get("name") or "")
+                    artist = _extract_netease_artist_names(s or {}) if isinstance(s, dict) else ""
+                    lines.append(f"{i}. {sid} {title} - {artist}".strip())
+            if not lines:
+                await reply(f"没有找到{_CHAT_SOURCE_LABELS.get(source, '')}结果")
+                return
+            hint = "歌曲ID" if source != "bilibili" else "BV号"
+            await reply(
+                f"{_CHAT_SOURCE_LABELS.get(source, '')}搜索结果(可直接用 add/play + {hint}):\n" + "\n".join(lines)
+            )
             return
 
         if cmd == "play" and not arg:
@@ -4050,42 +4640,58 @@ async def _handle_chat_command(
 
         if cmd in ("add", "play"):
             if not arg:
-                await reply(f"用法: {cmd} <歌曲ID|关键词>")
+                await reply(f"用法: {cmd} [qq|bili] <歌曲ID|关键词>")
                 return
 
-            song_id = _try_parse_song_id(arg)
-            title = ""
-            artist = ""
+            source, query = _parse_chat_source(arg)
+            if not query:
+                await reply(f"用法: {cmd} [qq|bili] <歌曲ID|关键词>")
+                return
 
-            if song_id is None:
-                raw = await netease.search(keywords=arg, limit=1)
-                meta = _extract_song_meta_from_search_first(raw)
-                if meta is None:
-                    await reply("没有找到结果")
-                    return
-                song_id, title, artist = meta
+            if source == "qqmusic":
+                item_id, title, artist = await _chat_enqueue_qqmusic(
+                    query, play_now=(cmd == "play"), requested_by=invoker_name
+                )
+                trial = False
+            elif source == "bilibili":
+                item_id, title, artist = await _chat_enqueue_bilibili(
+                    query, play_now=(cmd == "play"), requested_by=invoker_name
+                )
+                trial = False
             else:
-                # Use admin cookie for detail lookup.
-                session = new_session()
-                try:
-                    cookie = _get_admin_cookie(session)
-                finally:
-                    session.close()
-                detail = await netease.song_detail(song_id=song_id, cookie=cookie)
-                meta2 = _extract_song_meta_from_detail(detail, song_id)
-                if meta2 is not None:
-                    title, artist = meta2
-                else:
-                    title = song_id
+                song_id = _try_parse_song_id(query)
+                title = ""
+                artist = ""
 
-            item_id, trial = await _enqueue_netease_song(
-                song_id=song_id,
-                title=title,
-                artist=artist,
-                play_now=(cmd == "play"),
-                requested_by=invoker_name,
-                quality_level="auto",
-            )
+                if song_id is None:
+                    raw = await netease.search(keywords=query, limit=1)
+                    meta = _extract_song_meta_from_search_first(raw)
+                    if meta is None:
+                        await reply("没有找到结果")
+                        return
+                    song_id, title, artist = meta
+                else:
+                    # Use admin cookie for detail lookup.
+                    session = new_session()
+                    try:
+                        cookie = _get_admin_cookie(session)
+                    finally:
+                        session.close()
+                    detail = await netease.song_detail(song_id=song_id, cookie=cookie)
+                    meta2 = _extract_song_meta_from_detail(detail, song_id)
+                    if meta2 is not None:
+                        title, artist = meta2
+                    else:
+                        title = song_id
+
+                item_id, trial = await _enqueue_netease_song(
+                    song_id=song_id,
+                    title=title,
+                    artist=artist,
+                    play_now=(cmd == "play"),
+                    requested_by=invoker_name,
+                    quality_level="auto",
+                )
             song_label = f"{title} - {artist}".strip(" -")
             extra = ""
             if trial:
@@ -4123,6 +4729,9 @@ async def _handle_chat_command(
             return
         if e.status_code == 403:
             await reply("加载失败：无版权/地区限制/不可播放")
+            return
+        if e.status_code == 409 and detail:
+            await reply(detail)
             return
         if detail:
             await reply(f"error: {e.status_code}: {detail}")
@@ -4360,6 +4969,18 @@ async def admin_update_settings(
             await voice.close()
         if "voice" in effects and any(key.startswith("voice.description_") for key in req.values):
             _schedule_ts_description_update()
+        if any(
+            key in req.values
+            for key in (
+                "voice.ts3_cover_avatar",
+                "voice.ts3_lyric_nickname",
+                "voice.ts3_lyric_update_interval_ms",
+            )
+        ):
+            try:
+                await _reconcile_ts_presence()
+            except Exception:
+                logger.exception("failed to reconcile TeamSpeak now-playing presence")
     return {
         "ok": True,
         "voice_restart_requested": req.apply and "voice" in effects,

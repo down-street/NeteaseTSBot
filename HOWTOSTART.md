@@ -11,6 +11,8 @@ TSBot 是一个基于 TeamSpeak 的音乐机器人，包含 Python 后端、Vue 
 - **Rust**: 1.70+（推荐，默认语音服务实现）
 - **TeamSpeak 3 Client SDK**：仅旧版 C++ 语音服务路径需要；默认 Rust `voice-service` 不依赖它
 
+> **内存**：单独编译 `voice-service` 需要 1.2 GB 以上可用内存（见下文 OOM 章节），因此**编译环境建议 ≥2 GB 内存或 ≥1.2 GB 可用内存 + swap**。运行整套服务（voice + backend + web）建议 ≥512 MB 内存；如果机器只有 200 MB 左右，请直接使用预编译二进制/镜像，不要在本机编译（见「内存很小时如何部署」）。
+
 ## 快速开始
 
 ### 1. 克隆项目
@@ -69,6 +71,128 @@ make all
 make backend-setup  # 创建后端虚拟环境并安装依赖
 make web-build      # 安装前端依赖并构建生产产物
 make voice-build    # 构建语音服务
+```
+
+#### 语音服务编译内存不足（OOM / 被 killed）怎么办
+
+`voice-service` 依赖的 `ts-bookkeeping` 会生成约 1.7 MB 的 Rust 源码（单个 `s2c_messages.rs` 就有 895 KB），是整个构建里最吃内存的一步；再加上 cargo 默认并行编译多个 crate，内存较小的机器（1～2 GB）在 `make voice-build` 时很容易出现 `signal: 9, SIGKILL` / `out of memory` / `error: could not compile ts-bookkeeping`。
+
+实测 OOM 现场（2 GB 内存机器）：
+
+- 被杀的 `rustc` 当时 `anon-rss` 只有约 320 MB 且仍在增长，说明**并不是单个进程申请了 1～2 GB**；
+- 现场 `Free swap = 4962776kB`（约 4.9 GB swap 完全没用上），而 `inactive_anon` 有 1.45 GB、`Node 0 DMA32 free` 只剩 43 MB（低于 44.6 MB 水位线）；
+- 触发者是宿主机上的其他进程（阿里云安全组件 `AliYunDunUpdate`）申请一页内存失败，判定为 `global_oom`，然后按 `oom_score` 杀掉了最大的 `rustc`；
+- 根因是 **`vm.swappiness = 0`**：内核几乎不换出匿名页，宁可触发 OOM killer 也不用那 4.9 GB 空闲 swap。
+
+所以除了加 swap，**还必须确认 `vm.swappiness` 不是 0**，否则 swap 形同虚设。
+
+建议直接按下面的顺序做：**先加 swap，再用 `make voice-build-lowmem` 串行编译**。2 GB 内存 + 2～4 GB swap 的机器通常就能顺利编译完。
+
+按下面的顺序尝试，任选一种即可：
+
+**方案 A：加 swap（最稳，推荐 1～2 GB 内存的机器）**
+
+```bash
+# 创建 4 GB swap 文件（已存在则跳过）
+sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+# 开机自动挂载
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# 确认生效（Swap 一行应显示 4.0G）
+free -h
+
+# 关键：确认 swappiness 不是 0（0 会让内核宁可 OOM 也不用 swap）
+sysctl vm.swappiness
+sudo sysctl -w vm.swappiness=60
+echo 'vm.swappiness=60' | sudo tee /etc/sysctl.d/99-tsbot.conf
+```
+
+加完 swap 后再编译即可（swap 会明显变慢，但不会 OOM）：
+
+```bash
+cd voice-service && cargo build -j 1
+```
+
+**方案 B：降低编译内存占用（无 swap 或 swap 很小）**
+
+```bash
+# 关闭调试符号 + 串行编译，避免多个 rustc 同时占用内存
+make voice-build-lowmem
+# 等价于：cd voice-service && CARGO_PROFILE_DEV_DEBUG=0 cargo build -j 1
+```
+
+关键点是 `-j 1`：默认并行度会同时编译多个 crate，峰值内存成倍上升。如果单靠方案 B 仍然 OOM（例如可用内存不足 1.5 GB），请配合方案 A 一起使用。注意：关闭调试符号后无法再用 `make voice-gdb` 调试；需要调试时请先加 swap 再执行普通 `make voice-build`。
+
+**方案 C：把编译放到内存更大的机器或 CI**
+
+本仓库自带 GitHub Actions 工作流（`.github/workflows/docker-publish.yml`）：fork 或推送代码到 `main`/`master` 后，会自动构建并推送 `backend` / `web` / `voice-service` 三个镜像。服务器上直接拉取预构建镜像即可，不需要本地编译：
+
+```bash
+# 默认指向上游 yumi118 的旧镜像；改成你自己 fork 的命名空间才能用到新功能
+export TSBOT_IMAGE_NAMESPACE="你的DockerHub或GHCR命名空间"
+export TSBOT_IMAGE_TAG="latest"
+docker compose -f docker-compose.prebuilt.yml pull
+docker compose -f docker-compose.prebuilt.yml up -d
+```
+
+也可在任意 4 GB 以上内存的机器上执行 `docker build -f Dockerfile.voice-service -t tsbot-voice .`，再把镜像导入低配服务器。
+
+> 在 Docker / WSL2 中编译时，容器或虚拟机的内存上限同样会导致 OOM：WSL2 可在 `%UserProfile%\.wslconfig` 中增加 `[wsl2]` 与 `memory=8GB`，Docker Desktop 可在设置里调高内存后再构建。
+
+#### 内存很小时如何部署（不本地编译，适合 200 MB 级机器）
+
+**200 MB 内存无法本地编译**（单个依赖就要 1.2 GB 以上），正确做法是在别的机器/CI 上编译，把二进制搬到服务器运行。本仓库已经支持直接使用预编译二进制：`run-voicemake.sh` 会优先使用 `bin/voice-service` 或 `TSBOT_VOICE_BIN`，只有两者都不存在时才会调用 cargo 编译。
+
+**方式一：使用 CI 发布包（推荐）**
+
+`.github/workflows/docker-publish.yml` 的 `package` 任务会构建 `voice-service` 的 **release** 二进制并打包为 `tsbot-<版本>-linux-amd64.tar.gz`：
+
+- 推送到 `main`/`master`：在 GitHub Actions 该次运行的 **Artifacts** 里下载（保留 14 天）。
+- 打 `v*` 标签：会作为 **Release 资产**长期保留。
+
+在服务器上解压后直接启动即可，无需 cargo / Rust 工具链：
+
+```bash
+tar -xzf tsbot-<版本>-linux-amd64.tar.gz
+cd tsbot-<版本>-linux-amd64
+
+# 发布包内已包含 bin/voice-service，脚本会自动识别并跳过编译
+./nohup-start.sh          # 或前台：./run-voicemake.sh
+```
+
+> 打包出来的二进制是 **linux-amd64 + glibc**（Ubuntu runner 构建），适用于 Debian/Ubuntu/CentOS 等常见发行版；Alpine（musl）需要自行在对应环境编译。
+
+**方式二：只搬一个二进制文件**
+
+先把二进制放到服务器任意位置（例如 `/opt/tsbot/voice-service`），然后在 `tsbot.env` 里指定：
+
+```bash
+export TSBOT_VOICE_BIN="/opt/tsbot/voice-service"
+```
+
+`run-voicemake.sh`、`nohup-start.sh` 都会读取该变量并直接运行它，不再尝试编译。手动指定时记得 `chmod +x`。
+
+**方式三：搬 Docker 镜像**
+
+在大内存机器上 `docker build -f Dockerfile.voice-service -t tsbot-voice .`，再 `docker save tsbot-voice | gzip > tsbot-voice.tar.gz`，传到服务器 `docker load < tsbot-voice.tar.gz` 后使用 `docker-compose.prebuilt.yml`。
+
+**运行时内存提示（200 MB 机器）**
+
+即使不编译，整套服务在 200 MB 内存上也非常紧张：
+
+- `voice-service` 解码音频时会调用 `ffmpeg` 子进程，峰值几十 MB；
+- Python 后端（uvicorn + SQLAlchemy + httpx）通常需要 80～150 MB；
+- B 站字幕/AI 字幕抓取会启动 Playwright Chromium，单个进程就需要数百 MB，200 MB 机器上必然 OOM，建议关闭或避免使用 B 站字幕功能；
+- 前端建议用 nginx 直接托管 `web/dist`（比 `npm run preview` 省内存）。
+
+强烈建议至少加 1～2 GB swap 作为运行时兜底，或把整机升级到 512 MB～1 GB 内存：
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+free -h
 ```
 
 ## 运行项目

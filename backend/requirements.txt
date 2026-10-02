@@ -10,3 +10,4 @@ grpcio-tools==1.66.2
 yt-dlp==2026.3.17
 playwright>=1.52,<2
 qrcode[pil]>=8.2,<9
+pillow>=10

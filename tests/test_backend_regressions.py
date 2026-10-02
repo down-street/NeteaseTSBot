@@ -351,5 +351,223 @@ class VoiceStatusFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("", result["now_playing_title"])
 
 
+class ChatSourceParsingTests(unittest.TestCase):
+    def test_source_prefixes_and_aliases(self) -> None:
+        self.assertEqual(("qqmusic", "稻香"), main._parse_chat_source("qq 稻香"))
+        self.assertEqual(("qqmusic", "稻香"), main._parse_chat_source("QQ音乐:稻香"))
+        self.assertEqual(("bilibili", "猫"), main._parse_chat_source("bili 猫"))
+        self.assertEqual(("netease", "夜曲"), main._parse_chat_source("网易云 夜曲"))
+        self.assertEqual(("netease", "周杰伦 稻香"), main._parse_chat_source("周杰伦 稻香"))
+
+    def test_links_and_bv_ids_are_auto_detected(self) -> None:
+        self.assertEqual(("bilibili", "BV1xx411c7mD"), main._parse_chat_source("BV1xx411c7mD"))
+        self.assertEqual(
+            ("bilibili", "https://www.bilibili.com/video/BV1xx411c7mD"),
+            main._parse_chat_source("https://www.bilibili.com/video/BV1xx411c7mD"),
+        )
+        self.assertEqual(
+            ("qqmusic", "https://y.qq.com/n/ryqq/songDetail/003OUlho2HcRHC"),
+            main._parse_chat_source("https://y.qq.com/n/ryqq/songDetail/003OUlho2HcRHC"),
+        )
+        self.assertEqual("003OUlho2HcRHC", main._extract_query_qq_songmid("songmid=003OUlho2HcRHC"))
+        self.assertEqual("", main._extract_query_qq_songmid("稻香"))
+
+    def test_scrolling_nickname_format_and_truncation(self) -> None:
+        text = main._format_ts_scrolling_nickname("歌名", "这是一句很长的歌词内容用来测试截断行为", "歌手")
+        self.assertTrue(text.startswith("♪ 歌名 - "))
+        self.assertLessEqual(len(text), main._TS_NICKNAME_MAX_CHARS)
+        self.assertEqual("♪ 歌名 - 歌手", main._format_ts_scrolling_nickname("歌名", "", "歌手"))
+
+    def test_lyric_line_selection_uses_latest_timestamp(self) -> None:
+        lines = [
+            main.LyricLine(time=0.0, text="a"),
+            main.LyricLine(time=5.0, text="b"),
+            main.LyricLine(time=10.0, text="c"),
+        ]
+        self.assertEqual("", main._lyric_line_at(lines, -1.0))
+        self.assertEqual("a", main._lyric_line_at(lines, 1.0))
+        self.assertEqual("b", main._lyric_line_at(lines, 5.0))
+        self.assertEqual("c", main._lyric_line_at(lines, 30.0))
+
+    def test_avatar_resize_produces_bounded_image(self) -> None:
+        from io import BytesIO
+
+        from PIL import Image
+
+        buffer = BytesIO()
+        Image.new("RGB", (600, 600), (200, 30, 30)).save(buffer, format="PNG")
+        data = main._resize_ts_avatar(buffer.getvalue())
+        self.assertTrue(data.startswith(b"\xff\xd8\xff"))
+        self.assertLessEqual(len(data), main._TS_AVATAR_MAX_BYTES)
+        resized = Image.open(BytesIO(data))
+        self.assertLessEqual(max(resized.size), main._TS_AVATAR_MAX_EDGE)
+
+    def test_avatar_resize_rejects_invalid_bytes(self) -> None:
+        self.assertEqual(b"", main._resize_ts_avatar(b"not-an-image"))
+
+
+class MultiSourceChatCommandTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        main._ts_playlist_results.clear()
+
+    async def test_search_qq_lists_song_mids(self) -> None:
+        songs = [{"mid": "003OUlho2HcRHC", "name": "稻香", "singer": [{"name": "周杰伦"}]}]
+        with (
+            patch.object(main.qqmusic, "search_songs_simple", AsyncMock(return_value=songs)),
+            patch.object(main.voice, "send_notice", AsyncMock()) as notice,
+        ):
+            await main._handle_chat_command("Eve", "搜索 qq 稻香")
+
+        self.assertIn("003OUlho2HcRHC 稻香 - 周杰伦", notice.await_args.args[0])
+        self.assertIn("QQ音乐搜索结果", notice.await_args.args[0])
+
+    async def test_play_qq_enqueues_by_keyword(self) -> None:
+        songs = [
+            {
+                "mid": "003OUlho2HcRHC",
+                "name": "稻香",
+                "singer": [{"name": "周杰伦"}],
+                "album": {"mid": "album-mid", "name": "魔杰座"},
+            }
+        ]
+        with (
+            patch.object(main.qqmusic, "search_songs_simple", AsyncMock(return_value=songs)),
+            patch.object(main, "_enqueue_qqmusic_song", AsyncMock(return_value=(7, False))) as enqueue,
+            patch.object(main.voice, "send_notice", AsyncMock()) as notice,
+        ):
+            await main._handle_chat_command("Eve", "播放 qq 稻香")
+
+        enqueue.assert_awaited_once()
+        self.assertEqual("003OUlho2HcRHC", enqueue.await_args.kwargs["song_mid"])
+        self.assertTrue(enqueue.await_args.kwargs["play_now"])
+        self.assertIn("立即播放: #7 稻香 - 周杰伦", notice.await_args.args[0])
+
+    async def test_play_bilibili_bv_id_enqueues(self) -> None:
+        metadata = {
+            "title": "测试视频",
+            "artist": "UP主",
+            "album": "",
+            "duration_ms": 60000,
+            "artwork_url": "https://i0.hdslb.com/bfs/archive/x.jpg",
+        }
+        with (
+            patch.object(main, "_extract_bilibili_video_info", AsyncMock(return_value=metadata)),
+            patch.object(main, "_enqueue_bilibili_song", AsyncMock(return_value=(9, False))) as enqueue,
+            patch.object(main.voice, "send_notice", AsyncMock()) as notice,
+        ):
+            await main._handle_chat_command("Eve", "播放 bili BV1xx411c7mD")
+
+        self.assertEqual("BV1xx411c7mD", enqueue.await_args.kwargs["video_id"])
+        self.assertEqual("测试视频", enqueue.await_args.kwargs["title"])
+        self.assertIn("立即播放: #9 测试视频 - UP主", notice.await_args.args[0])
+
+    async def test_qq_playlist_search_then_select_enqueues_tracks(self) -> None:
+        playlists = [
+            {"dissid": "7011264340", "dissname": "测试歌单", "song_count": 2, "creator": {"name": "UP"}}
+        ]
+        tracks = [
+            {
+                "songmid": "003OUlho2HcRHC",
+                "songname": "稻香",
+                "singer": [{"name": "周杰伦"}],
+                "albummid": "album-mid",
+                "interval": 223,
+            }
+        ]
+        with (
+            patch.object(main.qqmusic, "search_playlists_simple", AsyncMock(return_value=playlists)),
+            patch.object(main.qqmusic, "get_song_list_simple", AsyncMock(return_value=tracks)),
+            patch.object(main, "_enqueue_qqmusic_song", AsyncMock(return_value=(1, False))) as enqueue,
+            patch.object(main.voice, "get_status", AsyncMock(return_value=SimpleNamespace(state="STATE_PLAYING"))),
+            patch.object(main.voice, "send_notice", AsyncMock()) as notice,
+            patch.object(main, "_auto_play_next_from_queue", AsyncMock()),
+        ):
+            await main._handle_chat_command("Eve", "歌单 qq 测试", invoker_unique_id="eve-uid")
+            await main._handle_chat_command("Eve", "选择 1", invoker_unique_id="eve-uid")
+
+        self.assertIn("QQ音乐歌单搜索结果", notice.await_args_list[0].args[0])
+        self.assertIn("已从QQ音乐歌单《测试歌单》加入 1 首歌曲", notice.await_args_list[1].args[0])
+        self.assertEqual("003OUlho2HcRHC", enqueue.await_args.kwargs["song_mid"])
+        self.assertEqual("稻香", enqueue.await_args.kwargs["title"])
+
+    async def test_bilibili_playlist_is_rejected(self) -> None:
+        with (
+            patch.object(main.voice, "send_notice", AsyncMock()) as notice,
+        ):
+            await main._handle_chat_command("Eve", "歌单 bili 猫")
+
+        self.assertIn("B站暂不支持歌单搜索", notice.await_args.args[0])
+
+
+class TsPresenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restore_presence_uses_base_nickname_and_default_avatar(self) -> None:
+        with (
+            patch.object(main.settings, "ts3_nickname", "测试机器人"),
+            patch.object(main, "_ts_last_nickname", "♪ 歌名 - 歌词"),
+            patch.object(main, "_ts_presence_generation", 5),
+            patch.object(main.voice, "set_client_nickname", AsyncMock()) as set_nickname,
+            patch.object(main.voice, "set_client_avatar", AsyncMock()) as set_avatar,
+        ):
+            await main._restore_ts_nickname(5)
+            await main._restore_ts_default_avatar(5)
+
+        set_nickname.assert_awaited_once_with("测试机器人")
+        set_avatar.assert_awaited_once_with(restore_default=True)
+
+    async def test_stale_generation_is_ignored(self) -> None:
+        with (
+            patch.object(main, "_ts_presence_generation", 6),
+            patch.object(main.voice, "set_client_avatar", AsyncMock()) as set_avatar,
+            patch.object(main.voice, "set_client_nickname", AsyncMock()) as set_nickname,
+        ):
+            await main._restore_ts_default_avatar(5)
+            await main._restore_ts_nickname(5)
+
+        set_avatar.assert_not_awaited()
+        set_nickname.assert_not_awaited()
+
+    async def test_cover_avatar_uses_resized_bytes(self) -> None:
+        with (
+            patch.object(main, "_ts_presence_generation", 3),
+            patch.object(main, "_fetch_ts_avatar_bytes", AsyncMock(return_value=b"img-bytes")),
+            patch.object(main.settings, "voice_cover_avatar_enabled", True),
+            patch.object(main.voice, "set_client_avatar", AsyncMock()) as set_avatar,
+        ):
+            await main._apply_ts_cover_avatar(3, "https://example.com/a.jpg")
+
+        set_avatar.assert_awaited_once_with(b"img-bytes")
+
+    async def test_cover_avatar_skipped_when_disabled(self) -> None:
+        with (
+            patch.object(main, "_ts_presence_generation", 4),
+            patch.object(main, "_fetch_ts_avatar_bytes", AsyncMock(return_value=b"img-bytes")) as fetch,
+            patch.object(main.settings, "voice_cover_avatar_enabled", False),
+            patch.object(main.voice, "set_client_avatar", AsyncMock()) as set_avatar,
+        ):
+            await main._apply_ts_cover_avatar(4, "https://example.com/a.jpg")
+
+        fetch.assert_not_awaited()
+        set_avatar.assert_not_awaited()
+
+
+class NewSettingDefinitionsTests(unittest.TestCase):
+    def test_new_teamspeak_settings_are_registered(self) -> None:
+        from backend.runtime_config import DEFINITION_BY_KEY
+
+        for key in (
+            "voice.ts3_cover_avatar",
+            "voice.ts3_lyric_nickname",
+            "voice.ts3_lyric_update_interval_ms",
+            "voice.ts3_filetransfer_port",
+        ):
+            self.assertIn(key, DEFINITION_BY_KEY)
+            self.assertEqual("teamspeak", DEFINITION_BY_KEY[key].group)
+
+        self.assertTrue(DEFINITION_BY_KEY["voice.ts3_cover_avatar"].default)
+        self.assertTrue(DEFINITION_BY_KEY["voice.ts3_lyric_nickname"].default)
+        self.assertEqual(2000, DEFINITION_BY_KEY["voice.ts3_lyric_update_interval_ms"].default)
+        self.assertEqual("ts3_nickname", DEFINITION_BY_KEY["voice.ts3_nickname"].backend_attr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -484,6 +484,23 @@ class QQMusicClient:
         except Exception:
             return []
 
+    async def search_playlists_simple(self, keyword: str, limit: int = 20, page: int = 1) -> list[dict[str, Any]]:
+        """搜索歌单（简化版）"""
+        try:
+            data = await self.search_with_keyword(keyword, search_type=3, result_num=limit, page_num=page)
+            body = data.get("req", {}).get("data", {}).get("body", {}) or {}
+            for key in ("songlist", "playlist", "disslist"):
+                block = body.get(key)
+                if isinstance(block, dict):
+                    items = block.get("list")
+                    if isinstance(items, list):
+                        return items
+                elif isinstance(block, list):
+                    return block
+            return []
+        except Exception:
+            return []
+
     async def get_song_lyric_simple(self, songmid: str, parse: bool = False) -> str | dict[str, Any] | None:
         """获取歌曲歌词（简化版）"""
         try:
