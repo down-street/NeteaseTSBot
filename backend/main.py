@@ -12,6 +12,7 @@ import re
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -58,6 +59,7 @@ from .managed_assets import ASSET_BY_KEY, asset_path, asset_payload, delete_asse
 from .netease import NeteaseClient
 from .netease_cookie import extract_netease_auth_cookie, has_netease_auth_cookie
 from .qqmusic import QQMusicClient
+from .tts import TTS_DIR, synthesize_tts_file, tts_audio_path
 from .voice_client import VoiceClient, VoiceStatus
 from .config import settings
 from .logger import logger
@@ -751,17 +753,18 @@ async def _ts_lyric_worker(item_id: int, generation: int) -> None:
             return
 
         lyrics = await _fetch_lyrics_for_item(int(item_id))
-        last_display = ""
         interval = _ts_lyric_interval_s()
 
         while True:
             if generation != _ts_presence_generation:
+                logger.debug("ts3 lyric worker superseded (item=%s)", item_id)
                 return
             if not _ts_lyric_nickname_enabled():
                 return
 
             async with _playback_lock:
                 if _current_queue_item_id != int(item_id):
+                    logger.debug("ts3 lyric worker stopped: now playing changed (item=%s)", item_id)
                     return
                 started_at = _play_started_at
                 paused_at = _paused_at
@@ -782,10 +785,12 @@ async def _ts_lyric_worker(item_id: int, generation: int) -> None:
             current_line = _lyric_line_at(lyrics, position_s)
 
             display = _format_ts_scrolling_nickname(title, current_line, artist)
-            if display and display != last_display:
+            # 与「实际最后一次下发的昵称」比较，而不是本地变量：
+            # 切歌时的“还原默认昵称”任务是异步的，可能在新视频开始后才落地；
+            # 用全局值比较可以在下一个周期自动纠正回来。
+            if display and display != _ts_last_nickname:
                 try:
                     await voice.set_client_nickname(display)
-                    last_display = display
                     _ts_last_nickname = display
                 except Exception as exc:
                     logger.warning("ts3 lyric nickname update failed, disabling: %s", exc)
@@ -2242,18 +2247,19 @@ def _fetch_bilibili_lyrics_sync(video_id: str, *, title: str = "", artist: str =
         if lyrics:
             return lyrics
 
-        playwright_candidates = asyncio.run(
-            fetch_bilibili_subtitle_candidates_via_playwright(normalized_video_id, admin_cookie)
-        )
-        lyrics = _resolve_bilibili_lyrics_from_candidates_sync(
-            normalized_video_id,
-            playwright_candidates,
-            title=title,
-            artist=artist,
-            cookie=admin_cookie,
-        )
-        if lyrics:
-            return lyrics
+        if bool(getattr(settings, "bilibili_browser_subtitle_enabled", False)):
+            playwright_candidates = asyncio.run(
+                fetch_bilibili_subtitle_candidates_via_playwright(normalized_video_id, admin_cookie)
+            )
+            lyrics = _resolve_bilibili_lyrics_from_candidates_sync(
+                normalized_video_id,
+                playwright_candidates,
+                title=title,
+                artist=artist,
+                cookie=admin_cookie,
+            )
+            if lyrics:
+                return lyrics
 
     return []
 
@@ -4080,6 +4086,110 @@ async def _chat_enqueue_bilibili(query: str, *, play_now: bool, requested_by: st
     return int(item_id), title or video_id, artist
 
 
+_TS_CHAT_COMMAND_ALIASES: dict[str, str] = {
+    "help": "help",
+    "h": "help",
+    "?": "help",
+    "帮助": "help",
+    "菜单": "help",
+    "指令": "help",
+    "命令": "help",
+    "search": "search",
+    "s": "search",
+    "find": "search",
+    "搜": "search",
+    "搜索": "search",
+    "查": "search",
+    "playlist": "playlist",
+    "playlists": "playlist",
+    "歌单list": "playlist",
+    "歌单": "playlist",
+    "歌单列表": "playlist",
+    "select": "select",
+    "选择": "select",
+    "选歌单": "select",
+    "歌单选择": "select",
+    "clear": "clear",
+    "清空": "clear",
+    "清空队列": "clear",
+    "random": "random",
+    "shuffle": "random",
+    "随机": "random",
+    "随机播放": "random",
+    "随机播放列表里的曲目": "random",
+    "order": "order",
+    "ordered": "order",
+    "顺序": "order",
+    "顺序播放": "order",
+    "顺序播放列表里的曲目": "order",
+    "add": "add",
+    "a": "add",
+    "加": "add",
+    "增加": "add",
+    "入队": "add",
+    "点歌": "add",
+    "play": "play",
+    "p": "play",
+    "播放": "play",
+    "来一首": "play",
+    "放": "play",
+    "vol": "vol",
+    "volume": "vol",
+    "音量": "vol",
+    "声音": "vol",
+    "now": "now",
+    "np": "now",
+    "status": "now",
+    "状态": "now",
+    "当前": "now",
+    "queue": "queue",
+    "q": "queue",
+    "队列": "queue",
+    "列表": "queue",
+    "pause": "pause",
+    "暂停": "pause",
+    "resume": "resume",
+    "continue": "resume",
+    "恢复": "resume",
+    "继续": "resume",
+    "stop": "stop",
+    "停止": "stop",
+    "skip": "skip",
+    "next": "skip",
+    "跳过": "skip",
+    "下一首": "skip",
+    "切歌": "skip",
+    "desc": "desc",
+    "简介": "desc",
+    "签名": "desc",
+    "fx": "fx",
+    "音效": "fx",
+}
+
+
+def _split_ts_chat_head(message: str) -> tuple[str, str]:
+    """Strip an optional '!' prefix and split the first token from the rest."""
+    s = (message or "").strip()
+    if s.startswith("!") or s.startswith("！"):
+        s = s[1:].lstrip()
+    if not s:
+        return "", ""
+    for sep in (" ", "\t", ":", "："):
+        idx = s.find(sep)
+        if idx != -1:
+            tail = s[idx + 1 :]
+            if sep in (":", "："):
+                tail = tail.lstrip()
+            return s[:idx], tail
+    return s, ""
+
+
+def _is_ts_chat_command(message: str) -> bool:
+    """Whether the message is a command for this bot (with or without '!')."""
+    head, _tail = _split_ts_chat_head(message)
+    return bool(head) and head.strip().lower() in _TS_CHAT_COMMAND_ALIASES
+
+
 async def _handle_chat_command(
     invoker_name: str,
     message: str,
@@ -4092,105 +4202,12 @@ async def _handle_chat_command(
     if not msg:
         return
 
-    s = msg
-    if s.startswith("!") or s.startswith("！"):
-        s = s[1:].lstrip()
-    if not s:
+    head, tail = _split_ts_chat_head(msg)
+    if not head:
         return
 
-    head = s
-    tail = ""
-    for sep in (" ", "\t", ":", "："):
-        idx = s.find(sep)
-        if idx != -1:
-            head = s[:idx]
-            tail = s[idx + 1 :]
-            if sep in (":", "："):
-                tail = tail.lstrip()
-            break
-
     head_norm = head.strip().lower()
-    alias_to_cmd = {
-        "help": "help",
-        "h": "help",
-        "?": "help",
-        "帮助": "help",
-        "菜单": "help",
-        "指令": "help",
-        "命令": "help",
-        "search": "search",
-        "s": "search",
-        "find": "search",
-        "搜": "search",
-        "搜索": "search",
-        "查": "search",
-        "playlist": "playlist",
-        "playlists": "playlist",
-        "歌单list": "playlist",
-        "歌单": "playlist",
-        "歌单列表": "playlist",
-        "select": "select",
-        "选择": "select",
-        "选歌单": "select",
-        "歌单选择": "select",
-        "clear": "clear",
-        "清空": "clear",
-        "清空队列": "clear",
-        "random": "random",
-        "shuffle": "random",
-        "随机": "random",
-        "随机播放": "random",
-        "随机播放列表里的曲目": "random",
-        "order": "order",
-        "ordered": "order",
-        "顺序": "order",
-        "顺序播放": "order",
-        "顺序播放列表里的曲目": "order",
-        "add": "add",
-        "a": "add",
-        "加": "add",
-        "增加": "add",
-        "入队": "add",
-        "点歌": "add",
-        "play": "play",
-        "p": "play",
-        "播放": "play",
-        "来一首": "play",
-        "放": "play",
-        "vol": "vol",
-        "volume": "vol",
-        "音量": "vol",
-        "声音": "vol",
-        "now": "now",
-        "np": "now",
-        "status": "now",
-        "状态": "now",
-        "当前": "now",
-        "queue": "queue",
-        "q": "queue",
-        "队列": "queue",
-        "列表": "queue",
-        "pause": "pause",
-        "暂停": "pause",
-        "resume": "resume",
-        "continue": "resume",
-        "恢复": "resume",
-        "继续": "resume",
-        "stop": "stop",
-        "停止": "stop",
-        "skip": "skip",
-        "next": "skip",
-        "跳过": "skip",
-        "下一首": "skip",
-        "切歌": "skip",
-        "desc": "desc",
-        "简介": "desc",
-        "签名": "desc",
-        "fx": "fx",
-        "音效": "fx",
-    }
-
-    cmd = alias_to_cmd.get(head_norm)
+    cmd = _TS_CHAT_COMMAND_ALIASES.get(head_norm)
     if not cmd:
         return
     arg = tail.strip()
@@ -4752,6 +4769,91 @@ async def _handle_playback_finished(source_url: str) -> None:
     await _auto_play_next_from_queue()
 
 
+_ts_tts_last_spoken_at: float = 0.0
+
+
+def _chat_tts_ignore_names() -> set[str]:
+    raw = str(getattr(settings, "chat_tts_ignore_names", "") or "")
+    names = {part.strip().lower() for part in re.split(r"[,\uFF0C;；]", raw) if part.strip()}
+    base = str(getattr(settings, "ts3_nickname", "") or "").strip().lower()
+    if base:
+        names.add(base)
+    return names
+
+
+def _chat_tts_should_skip(invoker_name: str, message: str) -> bool:
+    """Only plain chat messages from real users should be spoken."""
+    if not bool(getattr(settings, "chat_tts_enabled", True)):
+        return True
+    text = " ".join(str(message or "").split())
+    if not text:
+        return True
+    name = str(invoker_name or "").strip()
+    if name and name.lower() in _chat_tts_ignore_names():
+        return True
+    # 指令（含不带 ! 前缀的 play/点歌/播放 等）一律不念
+    if _is_ts_chat_command(text):
+        return True
+    if re.fullmatch(r"https?://\S+", text, re.IGNORECASE):
+        return True
+    if not re.search(r"[0-9A-Za-z\u4e00-\u9fff]", text):
+        return True
+    return False
+
+
+async def _maybe_speak_chat_message(invoker_name: str, message: str) -> None:
+    """Synthesize a chat message and let TS3AudioBot speak it immediately."""
+    global _ts_tts_last_spoken_at
+    try:
+        if _chat_tts_should_skip(invoker_name, message):
+            return
+
+        try:
+            cooldown = int(getattr(settings, "chat_tts_cooldown_s", 5) or 0)
+        except (TypeError, ValueError):
+            cooldown = 5
+        now = time.monotonic()
+        if cooldown > 0 and (now - _ts_tts_last_spoken_at) < cooldown:
+            return
+
+        try:
+            max_chars = int(getattr(settings, "chat_tts_max_chars", 60) or 60)
+        except (TypeError, ValueError):
+            max_chars = 60
+        body = " ".join(str(message or "").split())
+        if max_chars > 0 and len(body) > max_chars:
+            body = body[:max_chars] + "…"
+
+        template = str(getattr(settings, "chat_tts_prefix", "{name}说：") or "{name}说：")
+        speaker = str(invoker_name or "").strip() or "有人"
+        speak_text = template.replace("{name}", speaker) + body
+
+        path = await synthesize_tts_file(speak_text)
+        if path is None:
+            return
+
+        api_base = str(getattr(settings, "chat_tts_api_base", "") or "").rstrip("/")
+        public_base = str(getattr(settings, "chat_tts_public_base", "") or "").rstrip("/")
+        if not api_base or not public_base:
+            logger.warning("chat tts 跳过：未配置 api_base 或 public_base")
+            return
+        try:
+            bot_id = max(0, int(getattr(settings, "chat_tts_bot_id", 0) or 0))
+        except (TypeError, ValueError):
+            bot_id = 0
+
+        audio_url = f"{public_base}/tts/{path.name}"
+        # TS3AudioBot API 以 / 分隔参数，URL 参数必须整体转义（含斜杠）
+        api_url = f"{api_base}/api/bot/use/{bot_id}/(/play/{quote(audio_url, safe='')})"
+        _ts_tts_last_spoken_at = time.monotonic()
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(api_url)
+        if resp.status_code >= 400:
+            logger.warning("chat tts 播放失败: http=%s body=%s", resp.status_code, resp.text[:200])
+    except Exception as exc:
+        logger.warning("chat tts 失败: %s", exc)
+
+
 async def _chat_command_worker() -> None:
     retry_delay = 1.0
     while True:
@@ -4780,6 +4882,14 @@ async def _chat_command_worker() -> None:
                             target_mode=int(getattr(chat, "target_mode", 2) or 2),
                             invoker_unique_id=str(getattr(chat, "invoker_unique_id", "") or ""),
                         )
+                        if int(getattr(chat, "target_mode", 0) or 0) == 2:
+                            # 打后台执行，避免语音合成拖慢指令响应
+                            asyncio.create_task(
+                                _maybe_speak_chat_message(
+                                    str(getattr(chat, "invoker_name", "") or ""),
+                                    str(getattr(chat, "message", "") or ""),
+                                )
+                            )
                         continue
 
                     if kind == "playback":
@@ -4848,6 +4958,15 @@ def managed_asset_file(asset_key: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="尚未上传图片")
     media_type = detect_image_type(path.read_bytes()) or "application/octet-stream"
     return FileResponse(path, media_type=media_type, headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/tts/{name}")
+def chat_tts_audio_file(name: str) -> FileResponse:
+    """Serve synthesized chat TTS audio for TS3AudioBot to play."""
+    path = tts_audio_path(name)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path, media_type="audio/mpeg", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/auth/status")
@@ -6227,6 +6346,7 @@ async def admin_bilibili_status(request: Request, session: Session = Depends(get
     row = session.get(Secret, "bilibili_cookie")
     return {
         "admin_cookie_set": bool(row and row.value),
+        "playwright_disabled": not bool(getattr(settings, "bilibili_browser_subtitle_enabled", False)),
         "playwright_available": await is_playwright_runtime_available(),
         "playwright_dependency_installed": is_playwright_available(),
     }

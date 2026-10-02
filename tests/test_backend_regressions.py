@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import time
@@ -567,6 +568,173 @@ class NewSettingDefinitionsTests(unittest.TestCase):
         self.assertTrue(DEFINITION_BY_KEY["voice.ts3_lyric_nickname"].default)
         self.assertEqual(2000, DEFINITION_BY_KEY["voice.ts3_lyric_update_interval_ms"].default)
         self.assertEqual("ts3_nickname", DEFINITION_BY_KEY["voice.ts3_nickname"].backend_attr)
+
+
+class BilibiliBrowserSubtitleTests(unittest.IsolatedAsyncioTestCase):
+    def test_browser_subtitle_defaults_to_disabled(self) -> None:
+        from backend.runtime_config import DEFINITION_BY_KEY
+
+        definition = DEFINITION_BY_KEY["backend.bilibili_browser_subtitle"]
+        self.assertFalse(definition.default)
+        self.assertEqual("bilibili_browser_subtitle_enabled", definition.backend_attr)
+
+    def test_qr_login_does_not_need_playwright(self) -> None:
+        # 二维码登录走 HTTP 接口；只有 AI 字幕补抓才会启动 Chromium
+        import inspect
+
+        from backend import bilibili_auth
+
+        source = inspect.getsource(bilibili_auth.start_bilibili_qr_login_session)
+        self.assertNotIn("async_playwright", source)
+
+    async def test_status_reports_playwright_disabled(self) -> None:
+        with (
+            patch.object(main.settings, "bilibili_browser_subtitle_enabled", False),
+            patch.object(main, "is_playwright_runtime_available", AsyncMock(return_value=False)),
+            patch.object(main, "is_playwright_available", return_value=True),
+            patch.object(main, "new_session", return_value=unittest.mock.Mock()),
+            patch.object(main, "_require_admin_token"),
+        ):
+            result = await main.admin_bilibili_status(request=unittest.mock.Mock(), session=unittest.mock.Mock())
+
+        self.assertTrue(result["playwright_disabled"])
+        self.assertFalse(result["playwright_available"])
+
+
+class ChatTtsTests(unittest.IsolatedAsyncioTestCase):
+    def test_command_detection_without_prefix(self) -> None:
+        self.assertTrue(main._is_ts_chat_command("play 稻香"))
+        self.assertTrue(main._is_ts_chat_command("播放 qq 稻香"))
+        self.assertTrue(main._is_ts_chat_command("!stop"))
+        self.assertTrue(main._is_ts_chat_command("点歌 bili BV1xx411c7mD"))
+        self.assertFalse(main._is_ts_chat_command("今天天气不错"))
+        self.assertFalse(main._is_ts_chat_command("这首歌不错"))
+
+    def test_skip_rules(self) -> None:
+        with (
+            patch.object(main.settings, "chat_tts_enabled", True),
+            patch.object(main.settings, "chat_tts_ignore_names", "TS3AudioBot"),
+            patch.object(main.settings, "ts3_nickname", "qzh先生"),
+        ):
+            self.assertTrue(main._chat_tts_should_skip("Alice", "play 稻香"))
+            self.assertTrue(main._chat_tts_should_skip("TS3AudioBot", "大家好啊"))
+            self.assertTrue(main._chat_tts_should_skip("qzh先生", "大家好啊"))
+            self.assertTrue(main._chat_tts_should_skip("Alice", "https://example.com/a"))
+            self.assertTrue(main._chat_tts_should_skip("Alice", "🎵🎵"))
+            self.assertFalse(main._chat_tts_should_skip("Alice", "大家好啊"))
+
+    def test_disabled_skips_everything(self) -> None:
+        with patch.object(main.settings, "chat_tts_enabled", False):
+            self.assertTrue(main._chat_tts_should_skip("Alice", "大家好啊"))
+
+    async def test_speak_calls_ts3audiobot_with_encoded_url(self) -> None:
+        calls: list[str] = []
+
+        class FakeResponse:
+            status_code = 200
+            text = "ok"
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self) -> "FakeClient":
+                return self
+
+            async def __aexit__(self, *exc) -> None:
+                return None
+
+            async def get(self, url: str) -> FakeResponse:
+                calls.append(url)
+                return FakeResponse()
+
+        fake_file = SimpleNamespace(name="abc123.mp3")
+
+        with (
+            patch.object(main.settings, "chat_tts_enabled", True),
+            patch.object(main.settings, "chat_tts_ignore_names", "TS3AudioBot"),
+            patch.object(main.settings, "ts3_nickname", "qzh先生"),
+            patch.object(main.settings, "chat_tts_cooldown_s", 0),
+            patch.object(main.settings, "chat_tts_max_chars", 60),
+            patch.object(main.settings, "chat_tts_api_base", "http://ts3audiobot:58913"),
+            patch.object(main.settings, "chat_tts_public_base", "http://backend:8009"),
+            patch.object(main.settings, "chat_tts_prefix", "{name}说："),
+            patch.object(main, "_ts_tts_last_spoken_at", 0.0),
+            patch.object(main, "synthesize_tts_file", AsyncMock(return_value=fake_file)) as synth,
+            patch.object(main.httpx, "AsyncClient", FakeClient),
+        ):
+            await main._maybe_speak_chat_message("Alice", "大家好啊")
+
+        synth.assert_awaited_once()
+        self.assertEqual("Alice说：大家好啊", synth.await_args.args[0])
+        self.assertEqual(1, len(calls))
+        self.assertIn("/api/bot/use/0/(/play/", calls[0])
+        self.assertIn("http%3A%2F%2Fbackend%3A8009%2Ftts%2Fabc123.mp3", calls[0])
+
+    async def test_speak_truncates_long_message(self) -> None:
+        captured: list[str] = []
+
+        with (
+            patch.object(main.settings, "chat_tts_enabled", True),
+            patch.object(main.settings, "chat_tts_ignore_names", "TS3AudioBot"),
+            patch.object(main.settings, "ts3_nickname", "qzh先生"),
+            patch.object(main.settings, "chat_tts_cooldown_s", 0),
+            patch.object(main.settings, "chat_tts_max_chars", 5),
+            patch.object(main.settings, "chat_tts_prefix", "{name}说："),
+            patch.object(main, "_ts_tts_last_spoken_at", 0.0),
+            patch.object(main, "synthesize_tts_file", AsyncMock(side_effect=lambda text: captured.append(text) or None)),
+        ):
+            await main._maybe_speak_chat_message("Bob", "一二三四五六七八九十")
+
+        self.assertEqual(["Bob说：一二三四五…"], captured)
+
+    async def test_cooldown_blocks_second_message(self) -> None:
+        synth = AsyncMock(return_value=None)
+        with (
+            patch.object(main.settings, "chat_tts_enabled", True),
+            patch.object(main.settings, "chat_tts_ignore_names", "TS3AudioBot"),
+            patch.object(main.settings, "ts3_nickname", "qzh先生"),
+            patch.object(main.settings, "chat_tts_cooldown_s", 60),
+            patch.object(main, "_ts_tts_last_spoken_at", time.monotonic()),
+            patch.object(main, "synthesize_tts_file", synth),
+        ):
+            await main._maybe_speak_chat_message("Alice", "大家好啊")
+
+        synth.assert_not_awaited()
+
+
+class NicknameDriftTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_reasserts_nickname_after_external_reset(self) -> None:
+        """切歌后遗留的“还原默认昵称”覆盖了昵称时，worker 应在一个周期内改回来。"""
+        item = SimpleNamespace(id=7, title="测试视频", artist="UP主")
+        session = unittest.mock.Mock()
+        session.get.return_value = item
+        sent: list[str] = []
+
+        main._ts_presence_generation = 0
+        main._ts_last_nickname = "qzh先生"  # 被外部改回了默认昵称
+
+        with (
+            patch.object(main, "new_session", return_value=session),
+            patch.object(main, "_fetch_lyrics_for_item", AsyncMock(return_value=[])),
+            patch.object(main, "_ts_lyric_interval_s", return_value=0.05),
+            patch.object(main, "_current_queue_item_id", 7),
+            patch.object(main, "_play_started_at", time.monotonic()),
+            patch.object(main, "_paused_at", None),
+            patch.object(main, "_paused_total_s", 0.0),
+            patch.object(main.voice, "set_client_nickname", AsyncMock(side_effect=lambda name: sent.append(name))),
+        ):
+            generation = main._bump_ts_presence_generation()
+            task = asyncio.create_task(main._ts_lyric_worker(7, generation))
+            await asyncio.sleep(0.2)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        self.assertTrue(sent)
+        self.assertEqual("♪ 测试视频 - UP主", sent[0])
 
 
 if __name__ == "__main__":

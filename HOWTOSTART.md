@@ -200,6 +200,26 @@ export TSBOT_IMAGE_REPO="neteasetsbot"
 export TSBOT_IMAGE_TAG="v0.7.6"
 ```
 
+**频道打字转语音（可选）**
+
+TSBot 可以把频道里的普通聊天转成语音，交给 TS3AudioBot 念出来（「XX说：…」）：
+
+1. 让两个容器互相可达（一次性，不需要重建容器）：
+
+   ```bash
+   docker network connect tsbot_default ts3audiobot
+   ```
+
+   若不方便接入同一网络，也可以给 ts3audiobot 发布端口（`-p 127.0.0.1:58913:58913`），再把「TS3AudioBot API 地址」改成 `http://172.19.0.1:58913`。
+2. 在 Web「系统配置 → TeamSpeak 配置」确认：频道打字转语音=开、TS3AudioBot API 地址=`http://ts3audiobot:58913`、语音文件访问地址=`http://backend:8009`。
+3. 语音由 edge-tts（微软在线合成）生成，音色默认 `zh-CN-XiaoxiaoNeural`，可换成 `zh-CN-YunxiNeural`、`zh-CN-XiaoyiNeural` 等。
+4. 过滤规则：只念频道里的普通聊天；以 `!` 开头或任何已知指令（含不带前缀的 `play 稻香`、`点歌 xxx`、`播放 xxx`）都不念；机器人自己和忽略名单里的昵称不念；超长截断；两条之间有最小间隔。
+5. 播报使用 TS3AudioBot 的 `play`，会**立即插播**并打断它当前正在播放的音乐。想安静一点就把「频道打字转语音」关掉。
+
+**B 站字幕是否使用 Chromium**
+
+Web「系统配置 → 音乐接口配置 → 用浏览器补抓B站AI字幕」**默认关闭**：关闭时只使用 B站接口字幕（匿名 + 管理员登录态），**不会启动 Chromium**，也不会在打开 Web 登录页时探测浏览器。仅当某些视频的 AI 字幕必须在浏览器里才能拿到时，再临时开启。
+
 **运行时内存提示（200 MB 机器）**
 
 即使不编译，整套服务在 200 MB 内存上也非常紧张：

@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, urlparse
 import httpx
 
 from .logger import logger
+from .config import settings
 
 try:
     import qrcode
@@ -73,6 +74,11 @@ def is_playwright_available() -> bool:
     return async_playwright is not None
 
 
+def is_browser_subtitle_enabled() -> bool:
+    """Whether Chromium-based AI subtitle scraping is allowed."""
+    return bool(getattr(settings, "bilibili_browser_subtitle_enabled", False))
+
+
 def is_qrcode_available() -> bool:
     return qrcode is not None
 
@@ -102,7 +108,8 @@ def _get_playwright_launch_kwargs() -> dict[str, Any]:
 
 
 async def _probe_playwright_runtime_available() -> bool:
-    if async_playwright is None:
+    if async_playwright is None or not is_browser_subtitle_enabled():
+        # 关闭浏览器抓取时，绝不启动 Chromium（连探测也不做）。
         return False
 
     playwright = None
@@ -515,6 +522,9 @@ async def _try_enable_bilibili_ai_subtitle(page: Any) -> None:
 
 
 async def fetch_bilibili_subtitle_candidates_via_playwright(video_id: str, cookie: str) -> list[dict[str, Any]]:
+    if not is_browser_subtitle_enabled():
+        logger.info("bilibili browser subtitle scraping disabled; skip chromium for %s", video_id)
+        return []
     browser = None
     context = None
     page = None

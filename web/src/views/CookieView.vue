@@ -284,7 +284,7 @@
                     {{ bilibiliAdminStatus ? '已授权' : '未授权' }}
                   </span>
                 </h2>
-                <p class="text-gray-500 text-sm mt-2">用于服务器端登录态接口和 AI 字幕 Playwright 抓取兜底</p>
+                <p class="text-gray-500 text-sm mt-2">用于服务器端登录态接口字幕（Chromium 抓取默认可在“音乐接口配置”中开启）</p>
               </div>
             </div>
 
@@ -316,11 +316,13 @@
                     <CheckCircle2 v-if="bilibiliPlaywrightAvailable" :size="16" />
                     <AlertCircle v-else :size="16" />
                     {{
-                      bilibiliPlaywrightAvailable
-                        ? 'Playwright Chromium 已就绪，可用于 AI 字幕抓取'
-                        : bilibiliPlaywrightDependencyInstalled
-                          ? 'Playwright 已安装，但 Chromium 未就绪，请在服务器执行 python -m playwright install chromium'
-                          : 'Playwright 未安装，请先安装后端依赖并补装 Chromium'
+                      bilibiliPlaywrightDisabled
+                        ? '已按设置禁用浏览器抓取，仅使用B站接口字幕（不会启动 Chromium）'
+                        : bilibiliPlaywrightAvailable
+                          ? 'Playwright Chromium 已就绪，可用于 AI 字幕抓取'
+                          : bilibiliPlaywrightDependencyInstalled
+                            ? 'Playwright 已安装，但 Chromium 未就绪，请在服务器执行 python -m playwright install chromium'
+                            : 'Playwright 未安装，请先安装后端依赖并补装 Chromium'
                     }}
                   </div>
                 </div>
@@ -408,6 +410,7 @@ const bilibiliAdminQrSessionId = ref('')
 const bilibiliAdminQrImg = ref('')
 const bilibiliPlaywrightAvailable = ref(false)
 const bilibiliPlaywrightDependencyInstalled = ref(false)
+const bilibiliPlaywrightDisabled = ref(false)
 
 const adminManualCookie = ref('')
 const qqAdminManualCookie = ref('')
@@ -438,14 +441,16 @@ async function load() {
   }
 
   try {
-    const bst = await apiGet<{ admin_cookie_set: boolean; playwright_available?: boolean; playwright_dependency_installed?: boolean }>('/admin/bilibili/status', getAdminHeaders())
+    const bst = await apiGet<{ admin_cookie_set: boolean; playwright_available?: boolean; playwright_dependency_installed?: boolean; playwright_disabled?: boolean }>('/admin/bilibili/status', getAdminHeaders())
     bilibiliAdminStatus.value = !!bst?.admin_cookie_set
     bilibiliPlaywrightAvailable.value = !!bst?.playwright_available
     bilibiliPlaywrightDependencyInstalled.value = !!bst?.playwright_dependency_installed
+    bilibiliPlaywrightDisabled.value = !!bst?.playwright_disabled
   } catch {
     bilibiliAdminStatus.value = false
     bilibiliPlaywrightAvailable.value = false
     bilibiliPlaywrightDependencyInstalled.value = false
+    bilibiliPlaywrightDisabled.value = false
   }
 }
 
