@@ -163,9 +163,7 @@ cd tsbot-<版本>-linux-amd64
 ./nohup-start.sh          # 或前台：./run-voicemake.sh
 ```
 
-> 打包出来的二进制在 **Debian 11（glibc 2.31）容器**里编译，并且已改用 **rustls**（不依赖宿主机的 OpenSSL/libssl）。它需要宿主机 **glibc ≥ 2.31**，覆盖 Debian 11+、Ubuntu 20.04+、Alibaba Cloud Linux 3、RHEL/Rocky 9 等；CentOS 7 / RHEL 8（glibc 2.17/2.28）仍不支持，请改用 Docker 镜像运行。
->
-> 历史说明：v0.7.1 及更早的产物在 Ubuntu 24.04 runner 上编译，需要 **glibc ≥ 2.34 且 libssl.so.3**，因此只能在 Ubuntu 22.04+/Debian 12+/RHEL 9+ 上运行。
+> 打包出来的二进制在 GitHub 的 Ubuntu 24.04 runner 上编译，已改用 **rustls**（不再依赖宿主机的 OpenSSL/libssl），但仍需要宿主机 **glibc ≥ 2.34**，即 Ubuntu 22.04+/Debian 12+/RHEL 9+ 可直接运行；Alibaba Cloud Linux 3（glibc 2.32）、Ubuntu 20.04、CentOS 7/8 等较旧系统请改用 Docker 镜像运行（镜像自带运行时，与宿主机 glibc 无关）。
 
 **方式二：只搬一个二进制文件**
 

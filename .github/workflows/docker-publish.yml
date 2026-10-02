@@ -101,6 +101,8 @@ jobs:
         env:
           DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_SUFFIX: ${{ matrix.image_suffix }}
         run: |
           namespace="${DOCKERHUB_NAMESPACE:-$DOCKERHUB_USERNAME}"
           if [ -z "$namespace" ]; then
@@ -113,17 +115,25 @@ jobs:
           echo "ghcr_owner=${ghcr_owner}" >> "$GITHUB_OUTPUT"
           echo "repo=${repo}" >> "$GITHUB_OUTPUT"
 
-      - name: Check Docker Hub credentials
-        if: github.event_name != 'pull_request'
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          test -n "$DOCKERHUB_USERNAME" || { echo 'Missing secret: DOCKERHUB_USERNAME'; exit 1; }
-          test -n "$DOCKERHUB_TOKEN" || { echo 'Missing secret: DOCKERHUB_TOKEN'; exit 1; }
+          # 目标镜像列表：GHCR 始终推送（使用内置 GITHUB_TOKEN，无需任何 secret）；
+          # 只有在配置了 Docker Hub 凭据时才额外推送 Docker Hub。
+          images="ghcr.io/${ghcr_owner}/${repo}-${IMAGE_SUFFIX}"
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            images="docker.io/${namespace}/${repo}-${IMAGE_SUFFIX}
+${images}"
+            echo "push_dockerhub=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push_dockerhub=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::未配置 DOCKERHUB_USERNAME/DOCKERHUB_TOKEN，跳过 Docker Hub 推送，仅推送到 GHCR"
+          fi
+          {
+            echo "images<<__IMAGES__"
+            echo "$images"
+            echo "__IMAGES__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.prep.outputs.push_dockerhub == 'true'
         uses: docker/login-action@v3
         with:
           registry: docker.io
@@ -142,9 +152,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            docker.io/${{ steps.prep.outputs.namespace }}/${{ steps.prep.outputs.repo }}-${{ matrix.image_suffix }}
-            ghcr.io/${{ steps.prep.outputs.ghcr_owner }}/${{ steps.prep.outputs.repo }}-${{ matrix.image_suffix }}
+          images: ${{ steps.prep.outputs.images }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
@@ -213,18 +221,10 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build voice-service (Debian 11, glibc 2.31)
-        # 在旧 glibc 容器里编译，产物可在 Debian 11+/Ubuntu 20.04+/Alibaba Cloud Linux 3 等系统上运行。
-        # 配合 rustls（无 OpenSSL 依赖），不再需要宿主机安装 libssl。
-        run: |
-          docker run --rm -v "$PWD":/w -w /w debian:bullseye-slim bash -lc '
-            set -euo pipefail
-            apt-get update
-            apt-get install -y --no-install-recommends curl ca-certificates build-essential cmake pkg-config git
-            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-            . "$HOME/.cargo/env"
-            cargo build --manifest-path voice-service/Cargo.toml --release
-          '
+      - name: Build voice-service
+        # 产物为动态链接（需要宿主机 glibc >= 2.34）；已改用 rustls，不再依赖 libssl。
+        # 旧系统（如 Alibaba Cloud Linux 3 / Ubuntu 20.04）请直接使用 Docker 镜像运行。
+        run: cargo build --manifest-path voice-service/Cargo.toml --release
 
       - name: Create release bundle
         run: |
