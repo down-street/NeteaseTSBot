@@ -119,8 +119,7 @@ jobs:
           # 只有在配置了 Docker Hub 凭据时才额外推送 Docker Hub。
           images="ghcr.io/${ghcr_owner}/${repo}-${IMAGE_SUFFIX}"
           if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
-            images="docker.io/${namespace}/${repo}-${IMAGE_SUFFIX}
-${images}"
+            images="$(printf 'docker.io/%s/%s-%s\n%s' "$namespace" "$repo" "$IMAGE_SUFFIX" "$images")"
             echo "push_dockerhub=true" >> "$GITHUB_OUTPUT"
           else
             echo "push_dockerhub=false" >> "$GITHUB_OUTPUT"
