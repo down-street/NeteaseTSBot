@@ -179,6 +179,27 @@ export TSBOT_VOICE_BIN="/opt/tsbot/voice-service"
 
 在大内存机器上 `docker build -f Dockerfile.voice-service -t tsbot-voice .`，再 `docker save tsbot-voice | gzip > tsbot-voice.tar.gz`，传到服务器 `docker load < tsbot-voice.tar.gz` 后使用 `docker-compose.prebuilt.yml`。
 
+**切换镜像时的重要注意**：`docker-compose.prebuilt.yml` 里的镜像地址是用 **shell 环境变量**替换的
+（`${TSBOT_IMAGE_REGISTRY:-docker.io}/${TSBOT_IMAGE_NAMESPACE:-yumi118}/...`），而 `env_file: tsbot.env`
+只影响容器内部环境、**不会影响镜像名**。所以只把变量写进 `tsbot.env` 再 `docker compose up -d`，用的仍是旧镜像。
+正确做法是先把变量导出到当前 shell：
+
+```bash
+set -a; source tsbot.env; set +a
+docker compose -f docker-compose.prebuilt.yml pull
+docker compose -f docker-compose.prebuilt.yml up -d
+docker ps --format '{{.Names}} {{.Image}}'   # 确认三个容器都换成了新镜像
+```
+
+例如使用本项目 CI 产出的 GHCR 镜像（无需登录，包是公开的）：
+
+```bash
+export TSBOT_IMAGE_REGISTRY="ghcr.io"
+export TSBOT_IMAGE_NAMESPACE="down-street"
+export TSBOT_IMAGE_REPO="neteasetsbot"
+export TSBOT_IMAGE_TAG="v0.7.6"
+```
+
 **运行时内存提示（200 MB 机器）**
 
 即使不编译，整套服务在 200 MB 内存上也非常紧张：
