@@ -4969,7 +4969,9 @@ async def _chat_command_worker() -> None:
                             target_mode=int(getattr(chat, "target_mode", 2) or 2),
                             invoker_unique_id=str(getattr(chat, "invoker_unique_id", "") or ""),
                         )
-                        if int(getattr(chat, "target_mode", 0) or 0) == 2:
+                        # 频道消息(2) 与 服务器消息(3) 都触发播报：
+                        # 前者要求与机器人同频道，后者在任何频道都能被机器人收到。
+                        if int(getattr(chat, "target_mode", 0) or 0) in (2, 3):
                             # 打后台执行，避免语音合成拖慢指令响应
                             asyncio.create_task(
                                 _maybe_speak_chat_message(
