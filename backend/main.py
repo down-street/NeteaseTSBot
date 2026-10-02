@@ -4812,6 +4812,35 @@ async def _handle_playback_finished(source_url: str) -> None:
 
 _ts_tts_last_spoken_at: float = 0.0
 
+# 机器人自己发出的频道通知前缀：这些不能被当成"用户聊天"再念一遍
+_TS_SELF_NOTICE_PREFIXES = (
+    "立即播放:",
+    "已加入队列",
+    "已播放队列第一首",
+    "已从歌单",
+    "已从QQ音乐歌单",
+    "已切换为",
+    "已暂停",
+    "已恢复",
+    "已停止",
+    "已跳过",
+    "音量已设置为",
+    "搜索结果",
+    "网易云搜索结果",
+    "QQ音乐搜索结果",
+    "B站搜索结果",
+    "歌单搜索结果",
+    "网易云歌单搜索结果",
+    "QQ音乐歌单搜索结果",
+    "队列(前",
+    "当前:",
+    "已清空播放队列",
+    "加载失败",
+    "没有找到",
+    "用法:",
+    "error:",
+)
+
 
 def _chat_tts_ignore_names() -> set[str]:
     raw = str(getattr(settings, "chat_tts_ignore_names", "") or "")
@@ -4831,6 +4860,12 @@ def _chat_tts_should_skip(invoker_name: str, message: str) -> bool:
         return True
     name = str(invoker_name or "").strip()
     if name and name.lower() in _chat_tts_ignore_names():
+        return True
+    # 机器人自己改名后（♪ 开头）用昵称匹配不到，这里兜底
+    if name.startswith("♪"):
+        return True
+    # 机器人自己发出的通知也不要再念一遍（否则会自说自话）
+    if any(text.startswith(prefix) for prefix in _TS_SELF_NOTICE_PREFIXES):
         return True
     # 指令（含不带 ! 前缀的 play/点歌/播放 等）一律不念
     if _is_ts_chat_command(text):
@@ -4878,12 +4913,21 @@ async def _maybe_speak_chat_message(invoker_name: str, message: str) -> None:
         if not api_base or not public_base:
             logger.warning("chat tts 跳过：未配置 api_base 或 public_base")
             return
+
+        audio_url = f"{public_base}/tts/{path.name}"
+        speaker_mode = str(getattr(settings, "chat_tts_speaker", "TS3AUDIOBOT") or "").strip().lower()
+        if speaker_mode == "self":
+            # 由本机器人播报：保证出现在自己所在的频道（会打断当前音乐）
+            _ts_tts_last_spoken_at = time.monotonic()
+            await voice.play(source_url=audio_url, title=speak_text, requested_by="tts")
+            logger.info("chat tts 已用本机器人播报: %s", speak_text[:40])
+            return
+
         try:
             bot_id = max(0, int(getattr(settings, "chat_tts_bot_id", 0) or 0))
         except (TypeError, ValueError):
             bot_id = 0
 
-        audio_url = f"{public_base}/tts/{path.name}"
         # TS3AudioBot API 以 / 分隔参数，URL 参数必须整体转义（含斜杠）
         api_url = f"{api_base}/api/bot/use/{bot_id}/(/play/{quote(audio_url, safe='')})"
         _ts_tts_last_spoken_at = time.monotonic()

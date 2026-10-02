@@ -643,9 +643,32 @@ class ChatTtsTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(main._chat_tts_should_skip("Alice", "play 稻香"))
             self.assertTrue(main._chat_tts_should_skip("TS3AudioBot", "大家好啊"))
             self.assertTrue(main._chat_tts_should_skip("qzh先生", "大家好啊"))
+            self.assertTrue(main._chat_tts_should_skip("♪ 歌名 - 歌词", "大家好啊"))
+            self.assertTrue(main._chat_tts_should_skip("任意名字", "立即播放: #12 歌名 - 歌手"))
+            self.assertTrue(main._chat_tts_should_skip("任意名字", "已加入队列: #12 歌名"))
             self.assertTrue(main._chat_tts_should_skip("Alice", "https://example.com/a"))
             self.assertTrue(main._chat_tts_should_skip("Alice", "🎵🎵"))
             self.assertFalse(main._chat_tts_should_skip("Alice", "大家好啊"))
+
+    async def test_speaker_self_plays_through_our_voice_service(self) -> None:
+        fake_file = SimpleNamespace(name="abc123.mp3")
+        with (
+            patch.object(main.settings, "chat_tts_enabled", True),
+            patch.object(main.settings, "chat_tts_ignore_names", "TS3AudioBot"),
+            patch.object(main.settings, "ts3_nickname", "qzh先生"),
+            patch.object(main.settings, "chat_tts_cooldown_s", 0),
+            patch.object(main.settings, "chat_tts_speaker", "SELF"),
+            patch.object(main.settings, "chat_tts_public_base", "http://backend:8009"),
+            patch.object(main.settings, "chat_tts_api_base", "http://ts3audiobot:58913"),
+            patch.object(main.settings, "chat_tts_prefix", "{name}说："),
+            patch.object(main, "_ts_tts_last_spoken_at", 0.0),
+            patch.object(main, "synthesize_tts_file", AsyncMock(return_value=fake_file)),
+            patch.object(main.voice, "play", AsyncMock()) as play,
+        ):
+            await main._maybe_speak_chat_message("Alice", "大家好啊")
+
+        play.assert_awaited_once()
+        self.assertEqual("http://backend:8009/tts/abc123.mp3", play.await_args.kwargs["source_url"])
 
     def test_disabled_skips_everything(self) -> None:
         with patch.object(main.settings, "chat_tts_enabled", False):

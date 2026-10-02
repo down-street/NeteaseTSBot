@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     # 频道打字转语音（edge-tts + TS3AudioBot）
     chat_tts_enabled: bool = True
     chat_tts_api_base: str = "http://ts3audiobot:58913"
+    chat_tts_speaker: str = "TS3AUDIOBOT"
     chat_tts_bot_id: int = 0
     chat_tts_voice: str = "zh-CN-XiaoxiaoNeural"
     chat_tts_prefix: str = "{name}说："
