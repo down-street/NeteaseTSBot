@@ -1185,6 +1185,11 @@ async fn ts3_actor(
     let identity_str = get_env("TSBOT_TS3_IDENTITY", "");
     let identity_file = resolve_repo_relative(&get_env("TSBOT_TS3_IDENTITY_FILE", "./logs/identity.json"));
     let avatar_path = resolve_avatar_path_from_env();
+    // 跟随指定昵称的客户端所在的频道（空 = 关闭）。
+    // 用途：让机器人待在另一个机器人（例如 TS3AudioBot）所在的频道，
+    // 这样那个频道里的聊天消息才能被本机器人收到并触发播报。
+    let follow_client = get_env("TSBOT_TS3_FOLLOW_CLIENT", "");
+    let follow_client = follow_client.trim().to_string();
     let default_avatar_file: Option<PathBuf> = match avatar_path.as_ref() {
         Some(path) if path.is_file() => Some(path.clone()),
         Some(path) if path.is_dir() => pick_avatar_file(path),
@@ -1338,6 +1343,7 @@ async fn ts3_actor(
         let mut out_buf_drops: u64 = 0;
         let mut send_audio_errs: u64 = 0;
         let mut diag_next = Instant::now() + Duration::from_secs(5);
+        let mut follow_next = Instant::now() + Duration::from_secs(3);
 
         let mut event_tick = tokio::time::interval(std::time::Duration::from_millis(50));
         let mut send_tick = tokio::time::interval(std::time::Duration::from_millis(20));
@@ -1628,6 +1634,47 @@ async fn ts3_actor(
                         out_buf_max = out_buf.len();
                         send_jitter_max_ms = 0;
                         send_audio_errs = 0;
+                    }
+
+                    // 跟随模式：定期检查目标客户端所在频道，必要时把自己移过去。
+                    if !follow_client.is_empty() && now >= follow_next {
+                        follow_next = now + Duration::from_secs(5);
+                        let (own_clid, target_cid) = {
+                            match con.get_state() {
+                                Ok(st) => {
+                                    let own = st.clients.get(&st.own_client);
+                                    let target = st.clients.values().find(|c| c.name == follow_client);
+                                    match (own, target) {
+                                        (Some(own), Some(target)) if own.channel.0 != target.channel.0 => {
+                                            (Some(own.id.0), Some(target.channel.0))
+                                        }
+                                        _ => (None, None),
+                                    }
+                                }
+                                Err(_) => (None, None),
+                            }
+                        };
+                        if let (Some(own_clid), Some(cid)) = (own_clid, target_cid) {
+                            let mut cmd = OutCommand::new(
+                                Direction::C2S,
+                                Flags::empty(),
+                                PacketType::Command,
+                                "clientmove",
+                            );
+                            cmd.write_arg("clid", &own_clid.to_string());
+                            cmd.write_arg("cid", &cid.to_string());
+                            if let Ok(client) = con.get_tsproto_client_mut() {
+                                if let Err(e) = client.send_packet(cmd.into_packet()) {
+                                    emit_log(&events_tx, 3, format!("follow move failed: {e}"));
+                                } else {
+                                    emit_log(
+                                        &events_tx,
+                                        2,
+                                        format!("跟随 {} 移动到频道 {}", follow_client, cid),
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
 

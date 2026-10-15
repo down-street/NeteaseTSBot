@@ -1772,6 +1772,154 @@ def _build_bilibili_video_url(video_id: str) -> str:
     return f"https://www.bilibili.com/video/{raw}"
 
 
+_BILIBILI_LIVE_ROOM_RE = re.compile(r"live\.bilibili\.com/(?:blanc/)?(\d+)", re.IGNORECASE)
+_LIVE_ROOM_ID_RE = re.compile(r"^\d{2,12}$")
+_DIRECT_STREAM_RE = re.compile(r"^(https?|rtmp|rtsp)://", re.IGNORECASE)
+
+
+def _extract_live_room_id(target: str) -> str:
+    raw = (target or "").strip()
+    if _LIVE_ROOM_ID_RE.match(raw):
+        return raw
+    match = _BILIBILI_LIVE_ROOM_RE.search(raw)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _pick_live_stream_url(playurl: dict) -> str:
+    """从 B站 getRoomPlayInfo 的 playurl 结构里挑一条可播放的流地址。"""
+    for stream in (playurl or {}).get("stream") or []:
+        if not isinstance(stream, dict):
+            continue
+        for fmt in stream.get("format") or []:
+            if not isinstance(fmt, dict):
+                continue
+            for codec in fmt.get("codec") or []:
+                if not isinstance(codec, dict):
+                    continue
+                base_url = str(codec.get("base_url") or "").strip()
+                for url_info in codec.get("url_info") or []:
+                    if not isinstance(url_info, dict):
+                        continue
+                    host = str(url_info.get("host") or "").strip()
+                    extra = str(url_info.get("extra") or "")
+                    if host and base_url:
+                        return f"{host}{base_url}{extra}"
+    return ""
+
+
+async def _resolve_live_stream(target: str) -> dict:
+    """把 B站直播间链接/房间号/直链解析成可播放的音频流地址。"""
+    raw = (target or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="缺少直播地址")
+
+    room_id = _extract_live_room_id(raw)
+    if not room_id:
+        if _DIRECT_STREAM_RE.match(raw):
+            label = raw.split("?")[0].rstrip("/").split("/")[-1] or raw[:40]
+            return {"url": raw, "title": f"直播: {label}", "artist": "", "cover": "", "source": "direct"}
+        raise HTTPException(status_code=400, detail="无法识别的直播地址（支持 B站直播间链接/房间号或 http(s)/rtmp 流地址）")
+
+    headers = dict(_BILIBILI_DEFAULT_HEADERS)
+    async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
+        info_resp = await client.get(
+            "https://api.live.bilibili.com/room/v1/Room/get_info",
+            params={"room_id": room_id},
+        )
+        play_resp = await client.get(
+            "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo",
+            params={
+                "room_id": room_id,
+                "protocol": "0,1",
+                "format": "0,1,2",
+                "codec": "0,1",
+                "qn": 10000,
+                "platform": "web",
+                "ptype": 8,
+            },
+        )
+    if info_resp.status_code != 200 or play_resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"B站直播接口返回异常: info={info_resp.status_code} play={play_resp.status_code}")
+
+    info_data = (info_resp.json() or {}).get("data") or {}
+    if int(info_data.get("live_status") or 0) != 1:
+        raise HTTPException(status_code=409, detail=f"该直播间当前未开播（房间 {room_id}）")
+
+    play_data = (play_resp.json() or {}).get("data") or {}
+    playurl = ((play_data.get("playurl_info") or {}).get("playurl")) or {}
+    stream_url = _pick_live_stream_url(playurl)
+    if not stream_url:
+        raise HTTPException(status_code=404, detail="未能获取直播流地址（可能需要登录态或该直播间不可播放）")
+
+    return {
+        "url": stream_url,
+        "title": str(info_data.get("title") or f"B站直播 {room_id}").strip(),
+        "artist": str(info_data.get("uname") or "").strip() or f"房间 {room_id}",
+        "cover": str(info_data.get("user_cover") or info_data.get("keyframe") or "").strip(),
+        "source": "bilibili-live",
+    }
+
+
+async def _enqueue_live_stream(info: dict, *, requested_by: str) -> int:
+    """直播不是有限时长的曲目：直接建一条队列记录并立即播放。"""
+    url = str((info or {}).get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="直播流地址为空")
+    title = str((info or {}).get("title") or "直播").strip()
+    artist = str((info or {}).get("artist") or "").strip()
+    cover_url = str((info or {}).get("cover") or "").strip()
+    track_id = f"live:{hashlib.sha1(url.encode('utf-8')).hexdigest()[:16]}"
+
+    session = new_session()
+    try:
+        item = QueueItem(
+            track_id=track_id,
+            title=title,
+            artist=artist,
+            album="直播",
+            duration=0,
+            cover_url=cover_url,
+            source_url=url,
+        )
+        session.add(item)
+        session.commit()
+        item_id = int(item.id)
+
+        _schedule_ts_description_update()
+        await _set_now_playing_queue_item(
+            item_id,
+            url,
+            duration_ms=0,
+            artist=artist,
+            album="直播",
+            artwork_url=cover_url,
+        )
+        await voice.play(
+            source_url=url,
+            title=title,
+            requested_by=requested_by,
+            notice=f"开始播放直播: {title}",
+        )
+        session.add(
+            HistoryItem(
+                track_id=track_id,
+                title=title,
+                artist=artist,
+                album="直播",
+                duration=0,
+                cover_url=cover_url,
+                source_url=url,
+                requested_by=requested_by,
+            )
+        )
+        session.commit()
+        return item_id
+    finally:
+        session.close()
+
+
 def _normalize_bilibili_search_item(item: dict) -> dict | None:
     video_id = _extract_bilibili_video_id(item.get("bvid") or item.get("arcurl") or item.get("aid"))
     if not video_id:
@@ -3510,6 +3658,7 @@ def _format_help() -> str:
         "搜索|search [qq|bili] <keywords> - search songs/videos\n"
         "增加|add [qq|bili] <id|keywords> - add to queue\n"
         "播放|play [qq|bili] [id|keywords] - play now; no argument plays the first queue item\n"
+        "直播|live <B站房间号|直播间链接|流地址> - play live audio\n"
         "队列|queue - show queue\n"
         "歌单|playlist [qq] <keywords> - search playlists\n"
         "选择|select <number> - add a playlist from the last playlist search\n"
@@ -4181,6 +4330,10 @@ _TS_CHAT_COMMAND_ALIASES: dict[str, str] = {
     "播放": "play",
     "来一首": "play",
     "放": "play",
+    "live": "live",
+    "直播": "live",
+    "直播间": "live",
+    "看直播": "live",
     "vol": "vol",
     "volume": "vol",
     "音量": "vol",
@@ -4703,6 +4856,16 @@ async def _handle_chat_command(
             await reply(f"已播放队列第一首: {label}")
             return
 
+        if cmd == "live":
+            if not arg:
+                await reply("用法: 直播 <B站直播间链接|房间号|流地址>")
+                return
+            info = await _resolve_live_stream(arg)
+            item_id = await _enqueue_live_stream(info, requested_by=invoker_name)
+            label = f"{info.get('title')} - {info.get('artist')}".strip(" -")
+            await reply(f"开始播放直播: {label} (#{item_id})")
+            return
+
         if cmd in ("add", "play"):
             if not arg:
                 await reply(f"用法: {cmd} [qq|bili] <歌曲ID|关键词>")
@@ -4822,6 +4985,7 @@ _ts_tts_last_spoken_at: float = 0.0
 # 机器人自己发出的频道通知前缀：这些不能被当成"用户聊天"再念一遍
 _TS_SELF_NOTICE_PREFIXES = (
     "立即播放:",
+    "开始播放直播:",
     "已加入队列",
     "已播放队列第一首",
     "已从歌单",

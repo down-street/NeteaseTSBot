@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     voice_lyric_update_interval_ms: int = 2000
     ts3_filetransfer_port: int = 30033
     ts3_nickname: str = "tsbot"
+    ts3_follow_client: str = "音乐小超人"
     bilibili_max_duration_minutes: int = 180
     bilibili_audio_cache_ttl_hours: int = 72
     bilibili_audio_cache_max_mb: int = 2048

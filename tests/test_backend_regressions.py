@@ -353,6 +353,51 @@ class VoiceStatusFallbackTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChatSourceParsingTests(unittest.TestCase):
+    def test_live_room_id_extraction(self) -> None:
+        self.assertEqual("12345", main._extract_live_room_id("12345"))
+        self.assertEqual("5440", main._extract_live_room_id("https://live.bilibili.com/5440"))
+        self.assertEqual("5440", main._extract_live_room_id("https://live.bilibili.com/blanc/5440?x=1"))
+        self.assertEqual("", main._extract_live_room_id("https://example.com/a.m3u8"))
+        self.assertEqual("", main._extract_live_room_id("稻香"))
+
+    def test_pick_live_stream_url(self) -> None:
+        playurl = {
+            "stream": [
+                {
+                    "format": [
+                        {
+                            "codec": [
+                                {
+                                    "base_url": "/live/abc.flv",
+                                    "url_info": [
+                                        {"host": "https://cdn.example.com", "extra": "?token=1"},
+                                    ],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+        self.assertEqual(
+            "https://cdn.example.com/live/abc.flv?token=1",
+            main._pick_live_stream_url(playurl),
+        )
+        self.assertEqual("", main._pick_live_stream_url({}))
+
+    async def test_live_command_starts_playback(self) -> None:
+        info = {"url": "https://cdn.example.com/live.flv", "title": "测试直播", "artist": "主播", "cover": ""}
+        with (
+            patch.object(main, "_resolve_live_stream", AsyncMock(return_value=info)) as resolve,
+            patch.object(main, "_enqueue_live_stream", AsyncMock(return_value=42)) as enqueue,
+            patch.object(main.voice, "send_notice", AsyncMock()) as notice,
+        ):
+            await main._handle_chat_command("Alice", "直播 5440")
+
+        resolve.assert_awaited_once_with("5440")
+        enqueue.assert_awaited_once()
+        self.assertIn("开始播放直播", notice.await_args.args[0])
+
     def test_source_prefixes_and_aliases(self) -> None:
         self.assertEqual(("qqmusic", "稻香"), main._parse_chat_source("qq 稻香"))
         self.assertEqual(("qqmusic", "稻香"), main._parse_chat_source("QQ音乐:稻香"))

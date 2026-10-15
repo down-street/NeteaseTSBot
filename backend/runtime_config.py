@@ -64,6 +64,7 @@ DEFINITIONS: tuple[SettingDefinition, ...] = (
     SettingDefinition("voice.ts3_host", "teamspeak", "TeamSpeak 服务器", env="TSBOT_TS3_HOST", default="127.0.0.1", restart="voice"),
     SettingDefinition("voice.ts3_port", "teamspeak", "TeamSpeak 端口", type="integer", env="TSBOT_TS3_PORT", default=9987, minimum=1, maximum=65535, restart="voice"),
     SettingDefinition("voice.ts3_nickname", "teamspeak", "机器人昵称", env="TSBOT_TS3_NICKNAME", default="tsbot", restart="voice", backend_attr="ts3_nickname"),
+    SettingDefinition("voice.ts3_follow_client", "teamspeak", "跟随客户端所在频道", env="TSBOT_TS3_FOLLOW_CLIENT", default="音乐小超人", restart="voice", backend_attr="ts3_follow_client", help="填写另一个机器人/客户端的昵称，本机器人会自动移动到它所在的频道（留空关闭）。用途：与该客户端同频道的人打字才能被本机器人收到并触发语音播报。"),
     SettingDefinition("voice.ts3_server_password", "teamspeak", "服务器密码", type="password", env="TSBOT_TS3_SERVER_PASSWORD", sensitive=True, restart="voice"),
     SettingDefinition("voice.ts3_channel_id", "teamspeak", "频道 ID", env="TSBOT_TS3_CHANNEL_ID", restart="voice"),
     SettingDefinition("voice.ts3_channel_path", "teamspeak", "频道路径", env="TSBOT_TS3_CHANNEL_PATH", restart="voice"),

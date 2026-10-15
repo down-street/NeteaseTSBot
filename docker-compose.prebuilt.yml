@@ -1,6 +1,7 @@
 services:
   voice-service:
     image: ${TSBOT_IMAGE_REGISTRY:-docker.io}/${TSBOT_IMAGE_NAMESPACE:-yumi118}/${TSBOT_IMAGE_REPO:-neteasetsbot}-voice-service:${TSBOT_IMAGE_TAG:-latest}
+    restart: unless-stopped
     env_file:
       - tsbot.env
     ports:
@@ -12,6 +13,7 @@ services:
 
   backend:
     image: ${TSBOT_IMAGE_REGISTRY:-docker.io}/${TSBOT_IMAGE_NAMESPACE:-yumi118}/${TSBOT_IMAGE_REPO:-neteasetsbot}-backend:${TSBOT_IMAGE_TAG:-latest}
+    restart: unless-stopped
     env_file:
       - tsbot.env
     environment:
@@ -30,6 +32,7 @@ services:
 
   web:
     image: ${TSBOT_IMAGE_REGISTRY:-docker.io}/${TSBOT_IMAGE_NAMESPACE:-yumi118}/${TSBOT_IMAGE_REPO:-neteasetsbot}-web:${TSBOT_IMAGE_TAG:-latest}
+    restart: unless-stopped
     depends_on:
       - backend
     ports:

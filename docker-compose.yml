@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.voice-service
+    restart: unless-stopped
     env_file:
       - tsbot.env
     ports:
@@ -16,6 +17,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.backend
+    restart: unless-stopped
     env_file:
       - tsbot.env
     environment:
@@ -36,6 +38,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
+    restart: unless-stopped
     depends_on:
       - backend
     ports:
