@@ -1773,8 +1773,77 @@ def _build_bilibili_video_url(video_id: str) -> str:
 
 
 _BILIBILI_LIVE_ROOM_RE = re.compile(r"live\.bilibili\.com/(?:blanc/)?(\d+)", re.IGNORECASE)
-_LIVE_ROOM_ID_RE = re.compile(r"^\d{2,12}$")
+_LIVE_ROOM_ID_RE = re.compile(r"^\d{1,12}$")
 _DIRECT_STREAM_RE = re.compile(r"^(https?|rtmp|rtsp)://", re.IGNORECASE)
+_HUYA_RE = re.compile(r"huya\.com", re.IGNORECASE)
+_DOUYU_RE = re.compile(r"douyu\.com", re.IGNORECASE)
+_LIVE_PLATFORM_ALIASES = {
+    "dy": "douyu",
+    "douyu": "douyu",
+    "斗鱼": "douyu",
+    "huya": "huya",
+    "虎牙": "huya",
+    "bili": "bilibili",
+    "bilibili": "bilibili",
+    "b站": "bilibili",
+    "哔哩哔哩": "bilibili",
+}
+
+
+def _detect_live_platform(target: str) -> tuple[str, str]:
+    """返回 (平台, 房间号或链接)。平台: bilibili / huya / douyu / direct / ''。"""
+    raw = (target or "").strip()
+    if not raw:
+        return "", ""
+    parts = raw.split(None, 1)
+    if len(parts) == 2:
+        platform = _LIVE_PLATFORM_ALIASES.get(parts[0].strip().lower())
+        if platform and parts[1].strip():
+            return platform, parts[1].strip()
+    if _DOUYU_RE.search(raw):
+        return "douyu", raw
+    if _HUYA_RE.search(raw):
+        return "huya", raw
+    if _BILIBILI_LIVE_ROOM_RE.search(raw) or _LIVE_ROOM_ID_RE.match(raw):
+        return "bilibili", raw
+    if _DIRECT_STREAM_RE.match(raw):
+        return "direct", raw
+    return "", raw
+
+
+def _resolve_stream_with_ytdlp(url: str) -> dict | None:
+    """用 yt-dlp 解析任意直播页面（虎牙等），返回统一结构。"""
+    try:
+        yt_dlp = _get_yt_dlp_module()
+    except HTTPException:
+        return None
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "format": "bestaudio/best",
+    }
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if not isinstance(info, dict):
+        return None
+    stream_url = str(info.get("url") or "").strip()
+    if not stream_url:
+        for fmt in reversed(info.get("formats") or []):
+            candidate = str((fmt or {}).get("url") or "").strip()
+            if candidate:
+                stream_url = candidate
+                break
+    if not stream_url:
+        return None
+    return {
+        "url": stream_url,
+        "title": str(info.get("title") or url).strip(),
+        "artist": str(info.get("uploader") or info.get("channel") or "").strip(),
+        "cover": str(info.get("thumbnail") or "").strip(),
+        "source": str(info.get("extractor_key") or "ytdlp").lower(),
+    }
 
 
 def _extract_live_room_id(target: str) -> str:
@@ -1810,17 +1879,57 @@ def _pick_live_stream_url(playurl: dict) -> str:
 
 
 async def _resolve_live_stream(target: str) -> dict:
-    """把 B站直播间链接/房间号/直链解析成可播放的音频流地址。"""
+    """把直播间链接/房间号/直链解析成可播放的音频流地址。
+
+    支持：B站直播（接口解析）、虎牙（yt-dlp 解析）、任意 http(s)/rtmp 直链。
+    斗鱼目前启用了签名鉴权，自动解析不可用，会给出明确提示。
+    """
     raw = (target or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="缺少直播地址")
 
-    room_id = _extract_live_room_id(raw)
-    if not room_id:
+    platform, value = _detect_live_platform(raw)
+
+    if platform in ("huya", "douyu"):
+        page = value if value.lower().startswith("http") else (
+            f"https://www.huya.com/{value}" if platform == "huya" else f"https://www.douyu.com/{value}"
+        )
+        try:
+            resolved = await asyncio.to_thread(_resolve_stream_with_ytdlp, page)
+        except Exception as exc:
+            logger.info("%s 直播解析失败: %s", platform, exc)
+            resolved = None
+        if resolved:
+            return resolved
+        if platform == "douyu":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "斗鱼现已启用签名鉴权，无法自动解析直播流地址。"
+                    "请在浏览器打开该直播间，复制真实的 .flv/.m3u8 地址，再用「直播 <流地址>」播放。"
+                ),
+            )
+        raise HTTPException(status_code=404, detail="未能解析该虎牙直播间的流地址（可能未开播或需要登录）")
+
+    if platform != "bilibili":
+        # 其它未知链接：先交给 yt-dlp 试试（支持更多站点），失败就当成直链
         if _DIRECT_STREAM_RE.match(raw):
+            try:
+                resolved = await asyncio.to_thread(_resolve_stream_with_ytdlp, raw)
+            except Exception:
+                resolved = None
+            if resolved:
+                return resolved
             label = raw.split("?")[0].rstrip("/").split("/")[-1] or raw[:40]
             return {"url": raw, "title": f"直播: {label}", "artist": "", "cover": "", "source": "direct"}
-        raise HTTPException(status_code=400, detail="无法识别的直播地址（支持 B站直播间链接/房间号或 http(s)/rtmp 流地址）")
+        raise HTTPException(
+            status_code=400,
+            detail="无法识别的直播地址（支持 B站直播间/房间号、虎牙直播间、斗鱼直播间号，或 http(s)/rtmp 流地址）",
+        )
+
+    room_id = _extract_live_room_id(value or raw)
+    if not room_id:
+        raise HTTPException(status_code=400, detail="无法识别 B站直播间号/链接")
 
     headers = dict(_BILIBILI_DEFAULT_HEADERS)
     async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
@@ -3658,7 +3767,7 @@ def _format_help() -> str:
         "搜索|search [qq|bili] <keywords> - search songs/videos\n"
         "增加|add [qq|bili] <id|keywords> - add to queue\n"
         "播放|play [qq|bili] [id|keywords] - play now; no argument plays the first queue item\n"
-        "直播|live <B站房间号|直播间链接|流地址> - play live audio\n"
+        "直播|live <房间号|直播间链接|流地址> - live audio (B站/虎牙/直链; 斗鱼需用直链)\n"
         "队列|queue - show queue\n"
         "歌单|playlist [qq] <keywords> - search playlists\n"
         "选择|select <number> - add a playlist from the last playlist search\n"

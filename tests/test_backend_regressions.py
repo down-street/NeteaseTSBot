@@ -357,8 +357,32 @@ class ChatSourceParsingTests(unittest.TestCase):
         self.assertEqual("12345", main._extract_live_room_id("12345"))
         self.assertEqual("5440", main._extract_live_room_id("https://live.bilibili.com/5440"))
         self.assertEqual("5440", main._extract_live_room_id("https://live.bilibili.com/blanc/5440?x=1"))
+        self.assertEqual("1", main._extract_live_room_id("1"))
         self.assertEqual("", main._extract_live_room_id("https://example.com/a.m3u8"))
         self.assertEqual("", main._extract_live_room_id("稻香"))
+
+    def test_live_platform_detection(self) -> None:
+        self.assertEqual(("bilibili", "5440"), main._detect_live_platform("5440"))
+        self.assertEqual(("bilibili", "https://live.bilibili.com/5440"), main._detect_live_platform("https://live.bilibili.com/5440"))
+        self.assertEqual(("huya", "660000"), main._detect_live_platform("虎牙 660000"))
+        self.assertEqual(("huya", "https://www.huya.com/660000"), main._detect_live_platform("https://www.huya.com/660000"))
+        self.assertEqual(("douyu", "9999"), main._detect_live_platform("斗鱼 9999"))
+        self.assertEqual(("douyu", "https://www.douyu.com/9999"), main._detect_live_platform("https://www.douyu.com/9999"))
+        self.assertEqual(("direct", "https://x/a.m3u8"), main._detect_live_platform("https://x/a.m3u8"))
+
+    async def test_huya_live_resolved_via_ytdlp(self) -> None:
+        resolved = {"url": "http://cdn.huya/x.flv", "title": "虎牙房间", "artist": "主播", "cover": "", "source": "huya"}
+        with patch.object(main, "_resolve_stream_with_ytdlp", return_value=resolved) as fn:
+            info = await main._resolve_live_stream("虎牙 660000")
+        fn.assert_called_once_with("https://www.huya.com/660000")
+        self.assertEqual("http://cdn.huya/x.flv", info["url"])
+
+    async def test_douyu_live_reports_signed_api(self) -> None:
+        with patch.object(main, "_resolve_stream_with_ytdlp", return_value=None):
+            with self.assertRaises(HTTPException) as ctx:
+                await main._resolve_live_stream("斗鱼 9999")
+        self.assertEqual(409, ctx.exception.status_code)
+        self.assertIn("签名鉴权", str(ctx.exception.detail))
 
     def test_pick_live_stream_url(self) -> None:
         playurl = {
